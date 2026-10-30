@@ -803,3 +803,64 @@ fn branches_lists_empty_initially() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["branches"].as_array().unwrap().len(), 0);
 }
+
+#[test]
+fn sync_server_refuses_public_bind_without_confirm() {
+    let (tmp, _store) = temp_store("s12");
+    let srv = tmp.path().join("srv");
+    let out = amem()
+        .args([
+            "sync-server",
+            "--dir",
+            srv.to_str().unwrap(),
+            "--listen",
+            "0.0.0.0:18443",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("--public --confirm"), "{err}");
+    assert!(err.contains("no client auth"), "{err}");
+}
+
+#[test]
+fn corrupt_pin_file_fails_loud() {
+    let (_tmp, store) = temp_store("s13");
+    std::fs::create_dir_all(&store).unwrap();
+    amem_core::store::Store::open(&store).unwrap();
+    std::fs::write(store.join("sync_pins.json"), "{truncated").unwrap();
+    let out = amem()
+        .args([
+            "--store-dir",
+            store.to_str().unwrap(),
+            "sync",
+            "--endpoint",
+            "https://127.0.0.1:9/",
+            "--trust-new",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("corrupt"), "{err}");
+    assert!(!err.contains("TOFU"), "{err}");
+}
+
+#[test]
+fn init_cert_refuses_overwrite() {
+    let (tmp, _store) = temp_store("s14");
+    let srv = tmp.path().join("srv");
+    let out = amem()
+        .args(["sync-server", "--dir", srv.to_str().unwrap(), "--init-cert"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let out = amem()
+        .args(["sync-server", "--dir", srv.to_str().unwrap(), "--init-cert"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("refusing to overwrite"), "{err}");
+}

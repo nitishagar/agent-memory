@@ -39,6 +39,8 @@ struct SearchArgs {
     query: String,
     /// Stream filter, exact unless it contains `%` (`%` = all streams).
     stream: Option<String>,
+    /// Device filter, exact unless it contains `%` (`%` = whole team union, the default).
+    device: Option<String>,
     /// Max hits (1-200).
     limit: Option<i64>,
     /// `text` (default) or `json`.
@@ -59,6 +61,8 @@ struct ReadArgs {
 struct ListArgs {
     /// Stream filter, exact unless it contains `%` (`%` = all streams).
     stream: Option<String>,
+    /// Device filter, exact unless it contains `%` (`%` = whole team union, the default).
+    device: Option<String>,
     /// Max records (1-200).
     limit: Option<i64>,
     /// Skip this many newest records.
@@ -110,10 +114,13 @@ impl AmemServer {
             Ok(f) => f,
             Err(e) => return tool_err(render_error(&e, Format::Text)),
         };
-        match self
-            .mem
-            .search(&a.query, a.stream.as_deref(), a.limit.unwrap_or(20), format)
-        {
+        match self.mem.search(
+            &a.query,
+            a.stream.as_deref(),
+            a.device.as_deref(),
+            a.limit.unwrap_or(20),
+            format,
+        ) {
             Ok(out) => ok_text(out),
             Err(e) => tool_err(render_error(&e, format)),
         }
@@ -139,6 +146,7 @@ impl AmemServer {
         };
         match self.mem.list(
             a.stream.as_deref(),
+            a.device.as_deref(),
             a.limit.unwrap_or(50),
             a.offset.unwrap_or(0),
             format,

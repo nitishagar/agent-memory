@@ -10,15 +10,29 @@ pub const CERT_FILE: &str = "cert.pem";
 pub const KEY_FILE: &str = "key.pem";
 
 /// Generate a self-signed certificate (SANs: `localhost`, `127.0.0.1`, `::1`)
-/// into `dir`. Returns the blake3 fingerprint of the DER bytes.
+/// into `dir`. Returns the blake3 fingerprint of the DER bytes. Refuses to
+/// overwrite an existing cert (a silent rotation would break every client's
+/// pin); delete the files deliberately to rotate.
+///
+/// Files are created 0600 from the first byte (no world-readable window).
 ///
 /// # Errors
 ///
 /// Returns [`amem_core::error::Error::InvalidArguments`] when generation
-/// fails, [`amem_core::error::Error::Io`] on write failure.
+/// fails or a cert already exists, [`amem_core::error::Error::Io`] on
+/// write failure.
 pub fn init_cert(dir: &Path) -> amem_core::error::Result<String> {
     use amem_core::error::Error;
     std::fs::create_dir_all(dir)?;
+    for f in [CERT_FILE, KEY_FILE] {
+        if dir.join(f).exists() {
+            return Err(Error::InvalidArguments(format!(
+                "{f} already exists in {}; refusing to overwrite (rotation breaks every \
+                 client pin — back up and delete both files deliberately to rotate)",
+                dir.display()
+            )));
+        }
+    }
     let mut params = rcgen::CertificateParams::new(vec![
         "localhost".to_string(),
         "127.0.0.1".to_string(),
@@ -33,16 +47,33 @@ pub fn init_cert(dir: &Path) -> amem_core::error::Result<String> {
         .map_err(|e| Error::InvalidArguments(format!("self-sign: {e}")))?;
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
-    std::fs::write(dir.join(CERT_FILE), &cert_pem)?;
-    std::fs::write(dir.join(KEY_FILE), &key_pem)?;
+    write_private(&dir.join(CERT_FILE), cert_pem.as_bytes())?;
+    write_private(&dir.join(KEY_FILE), key_pem.as_bytes())?;
+    Ok(amem_core::store::hash_bytes_hex(cert.der()))
+}
+
+/// Write a file readable only by the owner from creation (no umask
+/// window where a local watcher could grab the private key).
+fn write_private(path: &Path, bytes: &[u8]) -> amem_core::error::Result<()> {
+    #[cfg(unix)]
+    use std::io::Write as _;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        for f in [CERT_FILE, KEY_FILE] {
-            let _ = std::fs::set_permissions(dir.join(f), std::fs::Permissions::from_mode(0o600));
-        }
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        Ok(())
     }
-    Ok(amem_core::store::hash_bytes_hex(cert.der()))
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
 }
 
 /// Load `cert.pem`/`key.pem` into a rustls server config.

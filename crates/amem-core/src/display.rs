@@ -39,7 +39,8 @@ pub fn first_line(s: &str) -> String {
 /// One hit line plus the owning device (short id): recall is
 /// union-wide, so foreign records must be attributable.
 pub fn render_hit(rec: &crate::store::Record) -> String {
-    let dev: String = rec.device.chars().take(8).collect();
+    // Device ids are uploader-controlled: sanitize like every other field.
+    let dev: String = sanitize(&rec.device).chars().take(8).collect();
     format!("{} @{}", render_hit_body(rec), dev)
 }
 

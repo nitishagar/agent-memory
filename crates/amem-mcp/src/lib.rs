@@ -106,6 +106,8 @@ impl Mem {
     }
 
     /// `mem_search`: substring search over payloads, newest first.
+    /// Union-wide by default (`device` scopes down); stale note versions
+    /// are flagged `superseded` so current and history don't blur.
     ///
     /// # Errors
     ///
@@ -114,44 +116,87 @@ impl Mem {
         &self,
         query: &str,
         stream: Option<&str>,
+        device: Option<&str>,
         limit: i64,
         format: Format,
     ) -> Result<String> {
         let db = self.read_store()?;
-        // Union-wide recall: teammates' synced records are searchable.
-        let hits = db.search_stream("%", stream.unwrap_or("%"), query, limit.clamp(1, 200))?;
+        let hits = db.search_stream(
+            device.unwrap_or("%"),
+            stream.unwrap_or("%"),
+            query,
+            limit.clamp(1, 200),
+        )?;
         Ok(match format {
             Format::Text => {
                 if hits.is_empty() {
                     "no matches".to_string()
                 } else {
-                    hits.iter().map(render_hit).collect::<Vec<_>>().join("\n")
+                    hits.iter()
+                        .map(|rec| text_hit(&db, rec))
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 }
             }
             Format::Json => serde_json::json!({
-                "results": hits.iter().map(record_json).collect::<Vec<_>>(),
+                "results": hits.iter().map(|rec| record_json(&db, rec)).collect::<Vec<_>>(),
             })
             .to_string(),
         })
     }
 
     /// `mem_read`: one full record by external id (exact or unique prefix).
+    /// Own device first, then any synced device (single hit reads,
+    /// several refuse as [`Error::Ambiguous`]).
     ///
     /// # Errors
     ///
     /// Returns [`Error::NotFound`], [`Error::Ambiguous`], or [`Error::Db`].
     pub fn read(&self, id: &str, stream: Option<&str>, format: Format) -> Result<String> {
         let db = self.read_store()?;
-        let (stream, idx) = db.resolve_external(&self.device, id, stream)?;
-        let rec = db.get_record(&self.device, &stream, idx)?;
-        // Conflict flag: branches claiming this record's external id.
-        let ext = db
-            .external_id(&self.device, &stream, idx)?
-            .unwrap_or_default();
+        let (rdev, stream, idx) = match db.resolve_external(&self.device, id, stream) {
+            Ok((stream, idx)) => (self.device.clone(), stream, idx),
+            Err(Error::NotFound(_)) => {
+                let hits = db.resolve_external_any(id, stream)?;
+                match hits.len() {
+                    0 => return Err(Error::NotFound(id.to_string())),
+                    1 => {
+                        let Some((device, stream, idx, _)) = hits.into_iter().next() else {
+                            return Err(Error::NotFound(id.to_string()));
+                        };
+                        (device, stream, idx)
+                    }
+                    _ => {
+                        let mut show: Vec<String> = hits
+                            .iter()
+                            .take(5)
+                            .map(|(d, s, i, _)| format!("{d}/{s}/{i}"))
+                            .collect();
+                        if hits.len() > 5 {
+                            show.push(format!("… and {} more", hits.len() - 5));
+                        }
+                        return Err(Error::Ambiguous(format!(
+                            "{id}: in {} places ({}); narrow with stream",
+                            hits.len(),
+                            show.join(", ")
+                        )));
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        };
+        let rec = db.get_record(&rdev, &stream, idx)?;
+        // Conflict flag: branches claiming this record's external id, or
+        // naming its triple as the winner (PK branches in cloned-device
+        // cases store the LOSER's id, so the triple match is the catch).
+        let ext = db.external_id(&rdev, &stream, idx)?.unwrap_or_default();
         let open: Vec<i64> = db
             .branch_list()?
             .iter()
-            .filter(|b| !b.ext_id.is_empty() && b.ext_id == ext)
+            .filter(|b| {
+                (!b.ext_id.is_empty() && b.ext_id == ext)
+                    || (b.stream == stream && b.winner_device == rdev && b.winner_idx == idx)
+            })
             .map(|b| b.id)
             .collect();
         Ok(match format {
@@ -159,7 +204,8 @@ impl Mem {
                 let payload: serde_json::Value =
                     serde_json::from_str(&rec.payload).unwrap_or(serde_json::Value::Null);
                 let mut out = format!(
-                    "id: {id}\nstream: {}\nidx: {}\nts_ns: {}\nactor: {}\nkind: {}\nchecksum: {}\nbody:\n{}",
+                    "id: {id}\ndevice: {}\nstream: {}\nidx: {}\nts_ns: {}\nactor: {}\nkind: {}\nchecksum: {}\nbody:\n{}",
+                    sanitize(&rdev),
                     sanitize(&rec.stream),
                     rec.idx,
                     rec.ts_ns,
@@ -179,7 +225,7 @@ impl Mem {
                 out
             }
             Format::Json => {
-                let mut v = record_json(&rec);
+                let mut v = record_json(&db, &rec);
                 v["conflicted"] = serde_json::Value::from(!open.is_empty());
                 v["branches"] = serde_json::json!(open);
                 v.to_string()
@@ -188,6 +234,7 @@ impl Mem {
     }
 
     /// `mem_list`: newest-first listing with offset pagination.
+    /// Union-wide by default (`device` scopes down).
     ///
     /// # Errors
     ///
@@ -195,13 +242,14 @@ impl Mem {
     pub fn list(
         &self,
         stream: Option<&str>,
+        device: Option<&str>,
         limit: i64,
         offset: i64,
         format: Format,
     ) -> Result<String> {
         let db = self.read_store()?;
         let hits = db.list_stream(
-            &self.device,
+            device.unwrap_or("%"),
             stream.unwrap_or("%"),
             limit.clamp(1, 200),
             offset.max(0),
@@ -211,11 +259,14 @@ impl Mem {
                 if hits.is_empty() {
                     "no records".to_string()
                 } else {
-                    hits.iter().map(render_hit).collect::<Vec<_>>().join("\n")
+                    hits.iter()
+                        .map(|rec| text_hit(&db, rec))
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 }
             }
             Format::Json => serde_json::json!({
-                "results": hits.iter().map(record_json).collect::<Vec<_>>(),
+                "results": hits.iter().map(|rec| record_json(&db, rec)).collect::<Vec<_>>(),
                 "offset": offset.max(0),
             })
             .to_string(),
@@ -375,7 +426,7 @@ impl Mem {
                 } else {
                     let mut out = format!("# memory brief ({} events)\n", hits.len());
                     for rec in &hits {
-                        out.push_str(&render_hit(rec));
+                        out.push_str(&text_hit(&db, rec));
                         out.push('\n');
                     }
                     out.pop();
@@ -383,18 +434,78 @@ impl Mem {
                 }
             }
             Format::Json => serde_json::json!({
-                "events": hits.iter().map(record_json).collect::<Vec<_>>(),
+                "events": hits.iter().map(|rec| record_json(&db, rec)).collect::<Vec<_>>(),
             })
             .to_string(),
         })
     }
 }
 
+/// External id for a hit (`{stream}#{idx}` when unmapped): JSON callers
+/// need the key `mem_read` accepts. Notes read the id from the payload
+/// (stale versions lost their mapping to the newer version).
+fn hit_id(db: &store::Store, rec: &Record) -> String {
+    if rec.stream == "notes" {
+        if let Some(id) = serde_json::from_str::<serde_json::Value>(&rec.payload)
+            .ok()
+            .and_then(|v| {
+                v.get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+        {
+            return id;
+        }
+    }
+    db.external_id(&rec.device, &rec.stream, rec.idx)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| format!("{}#{}", rec.stream, rec.idx))
+}
+
+/// A note hit is superseded when the id mapping moved past its `idx`
+/// (append-version history stays searchable, but must not pose as current).
+/// The id comes from the PAYLOAD: stale versions lost their mapping when
+/// the newer version repointed it.
+fn superseded(db: &store::Store, rec: &Record, _mapped_id: &str) -> bool {
+    if rec.stream != "notes" {
+        return false;
+    }
+    let payload_id: Option<String> = serde_json::from_str::<serde_json::Value>(&rec.payload)
+        .ok()
+        .and_then(|v| {
+            v.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+    let Some(payload_id) = payload_id else {
+        return false;
+    };
+    match db.resolve_external(&rec.device, &payload_id, Some("notes")) {
+        Ok((_, latest)) => latest != rec.idx,
+        Err(_) => false,
+    }
+}
+
+/// One hit line, with a stale-version marker for old note versions.
+fn text_hit(db: &store::Store, rec: &Record) -> String {
+    let line = render_hit(rec);
+    let id = hit_id(db, rec);
+    if superseded(db, rec, &id) {
+        format!("{line} (superseded)")
+    } else {
+        line
+    }
+}
+
 /// One record as JSON (checksums included: readers need them as guards).
-fn record_json(rec: &Record) -> serde_json::Value {
+fn record_json(db: &store::Store, rec: &Record) -> serde_json::Value {
     let payload: serde_json::Value =
         serde_json::from_str(&rec.payload).unwrap_or(serde_json::Value::Null);
+    let id = hit_id(db, rec);
+    let stale = superseded(db, rec, &id);
     serde_json::json!({
+        "id": id,
         "device": rec.device,
         "stream": rec.stream,
         "idx": rec.idx,
@@ -402,6 +513,7 @@ fn record_json(rec: &Record) -> serde_json::Value {
         "actor": rec.actor,
         "kind": rec.kind,
         "checksum": rec.hash,
+        "superseded": stale,
         "payload": payload,
         "summary": first_line(&render_hit(rec)),
     })

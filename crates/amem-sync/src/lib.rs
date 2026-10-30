@@ -22,14 +22,16 @@ pub fn run_sync(
     endpoint: &str,
     recover: bool,
     trust_new: bool,
+    expect_fingerprint: Option<&str>,
 ) -> amem_core::error::Result<client::Summary> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     rt.block_on(async move {
-        let transport = tls::HyperTransport::connect(endpoint, store_dir, trust_new)
-            .await
-            .map_err(|e| amem_core::error::Error::Sync(e.to_string()))?;
+        let transport =
+            tls::HyperTransport::connect(endpoint, store_dir, trust_new, expect_fingerprint)
+                .await
+                .map_err(|e| amem_core::error::Error::Sync(e.to_string()))?;
         let client = client::SyncClient::open(store_dir, endpoint, transport)?;
         client.sync(recover).await
     })

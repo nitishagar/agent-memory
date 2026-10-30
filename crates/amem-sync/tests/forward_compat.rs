@@ -63,14 +63,7 @@ async fn client_applies_unknown_versions() {
         "v": 2, "weird": true,
     })
     .to_string();
-    {
-        let mut core = ServerCore::open(&tmp.path().join("server.db")).unwrap();
-        core.post(&PostBody {
-            records: vec![raw],
-            client_caps: vec![],
-        })
-        .unwrap();
-    }
+    sim.post_raw_for_test(vec![raw]).unwrap();
     let dir = tmp.path().join("a");
     common::seed_shell(&dir, 1, "a");
     let c = SyncClient::open(&dir, EP, sim).unwrap();

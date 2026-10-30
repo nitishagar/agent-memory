@@ -79,6 +79,8 @@ pub struct Branch {
     pub winner_hash: String,
     /// Full loser envelope JSON.
     pub loser_envelope: String,
+    /// Hash of the loser envelope (dedupe key).
+    pub loser_hash: String,
     /// `pk` (same triple, different hash) or `id` (same external id).
     pub reason: String,
     /// Detection time, Unix ns.
@@ -321,9 +323,12 @@ impl Store {
                     winner_idx INTEGER NOT NULL,
                     winner_hash TEXT NOT NULL,
                     loser_envelope TEXT NOT NULL,
+                    loser_hash TEXT NOT NULL DEFAULT '',
                     reason TEXT NOT NULL,
                     ts_ns INTEGER NOT NULL
                 );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_branches_unique ON branches
+                    (stream, winner_device, winner_idx, winner_hash, reason, loser_hash);
                 CREATE TABLE IF NOT EXISTS sync_state (
                     endpoint TEXT PRIMARY KEY,
                     generation TEXT NOT NULL,
@@ -338,6 +343,23 @@ impl Store {
                     PRIMARY KEY (endpoint, device, stream)
                 );
                 INSERT INTO schema_version (version) VALUES (2);",
+            )?;
+        }
+        // Convergent fixup for pre-hardening v2 stores: the branch dedupe
+        // column + unique index. Idempotent; runs on every open.
+        let mut stmt = self.conn.prepare("PRAGMA table_info(branches)")?;
+        let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        let mut have_loser = false;
+        for name in cols {
+            if name.is_ok_and(|s| s == "loser_hash") {
+                have_loser = true;
+            }
+        }
+        if !have_loser {
+            self.conn.execute_batch(
+                "ALTER TABLE branches ADD COLUMN loser_hash TEXT NOT NULL DEFAULT '';
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_branches_unique ON branches
+                    (stream, winner_device, winner_idx, winner_hash, reason, loser_hash);",
             )?;
         }
         Ok(())
@@ -409,7 +431,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Db`] on `SQLite` failures.
+    /// Returns [`Error::Conflict`] when the id is already claimed by a
+    /// different triple (e.g. a teammate's synced note), [`Error::Db`] on
+    /// `SQLite` failures.
     pub fn insert_mapped(&mut self, spool_id: &str, rec: &NewRecord) -> Result<(i64, bool)> {
         let tx = self
             .conn
@@ -435,6 +459,25 @@ impl Store {
             )?;
             tx.commit()?;
             return Ok((idx, false));
+        }
+        // The global PK would reject a foreign-owned id with a raw Db
+        // error; report a typed Conflict naming the owner instead.
+        let owner: Option<(String, String, i64)> = tx
+            .query_row(
+                "SELECT device, stream, idx FROM spool_ids WHERE spool_id = ?1",
+                params![spool_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(Error::Db(other)),
+            })?;
+        if let Some((owner_device, owner_stream, owner_idx)) = owner {
+            return Err(Error::Conflict(format!(
+                "{spool_id}: id claimed by {owner_device}/{owner_stream}/{owner_idx}; \
+                 pick another id (see `amem branches`)"
+            )));
         }
         let next: i64 = tx.query_row(
             "SELECT COALESCE(MAX(idx), -1) + 1 FROM records WHERE device = ?1 AND stream = ?2",
@@ -559,23 +602,24 @@ impl Store {
         let pattern = format!("%{escaped}%");
         // Exact match unless the caller asked for a glob: a restrictive
         // MCP caller passing `transcript:claude_` must not over-match.
-        let device_op = if device_like.contains('%') {
-            "LIKE"
+        // In LIKE mode only `%` is a wildcard: `\` and `_` are escaped.
+        let (device_pred, device_param) = if device_like.contains('%') {
+            ("device LIKE ?1 ESCAPE '\\'", escape_like(device_like))
         } else {
-            "="
+            ("device = ?1", device_like.to_string())
         };
-        let stream_op = if stream_like.contains('%') {
-            "LIKE"
+        let (stream_pred, stream_param) = if stream_like.contains('%') {
+            ("stream LIKE ?2 ESCAPE '\\'", escape_like(stream_like))
         } else {
-            "="
+            ("stream = ?2", stream_like.to_string())
         };
         let sql = format!(
             "SELECT device, stream, idx, ts_ns, actor, kind, payload, hash
-             FROM records WHERE device {device_op} ?1 AND stream {stream_op} ?2
+             FROM records WHERE {device_pred} AND {stream_pred}
              AND payload LIKE ?3 ESCAPE '\\' ORDER BY ts_ns DESC LIMIT ?4"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![device_like, stream_like, pattern, limit], |r| {
+        let rows = stmt.query_map(params![device_param, stream_param, pattern, limit], |r| {
             Ok(Record {
                 device: r.get(0)?,
                 stream: r.get(1)?,
@@ -801,7 +845,13 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`Error::Db`] on `SQLite` failure.
-    pub fn apply_remote(&mut self, rec: &NewRecord, idx: i64, ext_id: &str) -> Result<bool> {
+    pub fn apply_remote(
+        &mut self,
+        rec: &NewRecord,
+        idx: i64,
+        ext_id: &str,
+        loser_envelope: Option<&str>,
+    ) -> Result<bool> {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -823,6 +873,63 @@ impl Store {
             "INSERT OR IGNORE INTO spool_ids (spool_id, device, stream, idx) VALUES (?1, ?2, ?3, ?4)",
             params![ext_id, rec.device, rec.stream, idx],
         )?;
+        // The mapping PK keeps only the first claimant. When a freshly
+        // applied record loses the mapping to an earlier triple, branch
+        // immediately instead of dropping the conflict silently (a third
+        // device's same-id download must still compare against both).
+        if changed == 1 && !ext_id.is_empty() {
+            let owner: Option<(String, String, i64)> = tx
+                .query_row(
+                    "SELECT device, stream, idx FROM spool_ids WHERE spool_id = ?1",
+                    params![ext_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    other => Err(Error::Db(other)),
+                })?;
+            if let Some((owner_device, owner_stream, owner_idx)) = owner {
+                if owner_device != rec.device || owner_stream != rec.stream || owner_idx != idx {
+                    let winner_hash: String = tx.query_row(
+                        "SELECT hash FROM records WHERE device = ?1 AND stream = ?2 AND idx = ?3",
+                        params![owner_device, owner_stream, owner_idx],
+                        |r| r.get(0),
+                    )?;
+                    // Prefer the caller's wire bytes so this branch
+                    // collapses with the downloader's own `id` branch for
+                    // the same conflict (same loser hash, one row).
+                    let loser = loser_envelope.map_or_else(
+                        || {
+                            serde_json::json!({
+                                "id": ext_id, "device": rec.device, "stream": rec.stream,
+                                "idx": idx, "ts_ns": rec.ts_ns, "actor": rec.actor,
+                                "kind": rec.kind, "payload": rec.payload, "hash": rec.hash,
+                            })
+                            .to_string()
+                        },
+                        str::to_string,
+                    );
+                    let loser_hash = hash_payload(&loser);
+                    tx.execute(
+                        "INSERT OR IGNORE INTO branches
+                            (ext_id, stream, winner_device, winner_idx, winner_hash,
+                             loser_envelope, loser_hash, reason, ts_ns)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'id', ?8)",
+                        params![
+                            ext_id,
+                            owner_stream,
+                            owner_device,
+                            owner_idx,
+                            winner_hash,
+                            loser,
+                            loser_hash,
+                            crate::clock::now_nanos()
+                        ],
+                    )?;
+                }
+            }
+        }
         tx.commit()?;
         Ok(changed == 1)
     }
@@ -857,6 +964,9 @@ impl Store {
             "DELETE FROM spool_ids WHERE device = ?1 AND stream = ?2 AND idx = ?3",
             params![device, stream, idx],
         )?;
+        // Explicit re-quarantine supersedes: the live record is being
+        // deleted here, so its envelope must land (REPLACE), unlike
+        // `quarantine_put` where first evidence wins.
         tx.execute(
             "INSERT OR REPLACE INTO quarantine (device, stream, idx, envelope, reason, ts_ns)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -867,6 +977,8 @@ impl Store {
     }
 
     /// File a downloaded envelope directly into quarantine (failed validation).
+    /// First evidence wins (`OR IGNORE`): a later envelope for the same
+    /// triple must not clobber the earlier one.
     ///
     /// # Errors
     ///
@@ -881,7 +993,7 @@ impl Store {
         ts_ns: i64,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO quarantine (device, stream, idx, envelope, reason, ts_ns)
+            "INSERT OR IGNORE INTO quarantine (device, stream, idx, envelope, reason, ts_ns)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![device, stream, idx, envelope, reason, ts_ns],
         )?;
@@ -1024,7 +1136,10 @@ impl Store {
     }
 
     /// Record a conflict branch: the winner stays canonical, the loser
-    /// envelope is preserved verbatim. Returns the branch row id.
+    /// envelope is preserved verbatim. Idempotent on
+    /// `(stream, winner triple, winner hash, reason, loser hash)`:
+    /// concurrent syncs inserting the same branch collapse into one row.
+    /// Returns the branch row id, or `None` when the branch already exists.
     ///
     /// # Errors
     ///
@@ -1038,12 +1153,14 @@ impl Store {
         winner_idx: i64,
         winner_hash: &str,
         loser_envelope: &str,
+        loser_hash: &str,
         reason: &str,
         ts_ns: i64,
-    ) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO branches (ext_id, stream, winner_device, winner_idx, winner_hash, loser_envelope, reason, ts_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    ) -> Result<Option<i64>> {
+        let changed = self.conn.execute(
+            "INSERT OR IGNORE INTO branches
+                (ext_id, stream, winner_device, winner_idx, winner_hash, loser_envelope, loser_hash, reason, ts_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 ext_id,
                 stream,
@@ -1051,11 +1168,16 @@ impl Store {
                 winner_idx,
                 winner_hash,
                 loser_envelope,
+                loser_hash,
                 reason,
                 ts_ns
             ],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        if changed == 1 {
+            Ok(Some(self.conn.last_insert_rowid()))
+        } else {
+            Ok(None)
+        }
     }
 
     /// List every conflict branch, oldest first.
@@ -1065,7 +1187,7 @@ impl Store {
     /// Returns [`Error::Db`] on `SQLite` failure.
     pub fn branch_list(&self) -> Result<Vec<Branch>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, ext_id, stream, winner_device, winner_idx, winner_hash, loser_envelope, reason, ts_ns
+            "SELECT id, ext_id, stream, winner_device, winner_idx, winner_hash, loser_envelope, loser_hash, reason, ts_ns
              FROM branches ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1077,8 +1199,9 @@ impl Store {
                 winner_idx: r.get(4)?,
                 winner_hash: r.get(5)?,
                 loser_envelope: r.get(6)?,
-                reason: r.get(7)?,
-                ts_ns: r.get(8)?,
+                loser_hash: r.get(7)?,
+                reason: r.get(8)?,
+                ts_ns: r.get(9)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -1100,6 +1223,20 @@ impl Store {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(Error::Db(e)),
         }
+    }
+
+    /// Every endpoint with pinned sync state (unquarantine resets each).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Db`] on `SQLite` failure.
+    pub fn sync_state_list(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT endpoint FROM sync_state ORDER BY endpoint")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::Db)
     }
 
     /// Pin the sync generation for an endpoint.
@@ -1185,6 +1322,25 @@ impl Store {
         Ok(())
     }
 
+    /// Drop one series' cursors (unquarantine restoring a below-water
+    /// record re-opens its series; re-upload is idempotent).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Db`] on `SQLite` failure.
+    pub fn sync_marks_reset_series(
+        &self,
+        endpoint: &str,
+        device: &str,
+        stream: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM sync_marks WHERE endpoint = ?1 AND device = ?2 AND stream = ?3",
+            params![endpoint, device, stream],
+        )?;
+        Ok(())
+    }
+
     /// Every cursor row for an endpoint: `(device, stream, up_idx, down_idx)`.
     ///
     /// # Errors
@@ -1202,6 +1358,22 @@ impl Store {
                 r.get::<_, i64>(3)?,
             ))
         })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::Db)
+    }
+
+    /// Distinct `(device, stream)` series in the store (`--recover`
+    /// re-pushes foreign series too, so records whose owner is gone still
+    /// survive a server rebuild; re-push is hash-verified + idempotent).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Db`] on `SQLite` failure.
+    pub fn all_series(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT device, stream FROM records ORDER BY device, stream")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Error::Db)
     }
@@ -1231,30 +1403,37 @@ impl Store {
             .query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))?)
     }
 
-    /// Newest-first listing with offset pagination. `stream_like` follows
-    /// the [`Store::search_stream`] exact-unless-`%` rule.
+    /// Newest-first listing with offset pagination. `device_like` and
+    /// `stream_like` follow the [`Store::search_stream`] exact-unless-`%`
+    /// rule (`%` = whole team union).
     ///
     /// # Errors
     ///
     /// Returns [`Error::Db`] on `SQLite` failure.
     pub fn list_stream(
         &self,
-        device: &str,
+        device_like: &str,
         stream_like: &str,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Record>> {
-        let sql = if stream_like.contains('%') {
-            "SELECT device, stream, idx, ts_ns, actor, kind, payload, hash
-             FROM records WHERE device = ?1 AND stream LIKE ?2
-             ORDER BY ts_ns DESC, stream, idx LIMIT ?3 OFFSET ?4"
+        let (device_pred, device_param) = if device_like.contains('%') {
+            ("device LIKE ?1 ESCAPE '\\'", escape_like(device_like))
         } else {
-            "SELECT device, stream, idx, ts_ns, actor, kind, payload, hash
-             FROM records WHERE device = ?1 AND stream = ?2
-             ORDER BY ts_ns DESC, stream, idx LIMIT ?3 OFFSET ?4"
+            ("device = ?1", device_like.to_string())
         };
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map(params![device, stream_like, limit, offset], |r| {
+        let (stream_pred, stream_param) = if stream_like.contains('%') {
+            ("stream LIKE ?2 ESCAPE '\\'", escape_like(stream_like))
+        } else {
+            ("stream = ?2", stream_like.to_string())
+        };
+        let sql = format!(
+            "SELECT device, stream, idx, ts_ns, actor, kind, payload, hash
+             FROM records WHERE {device_pred} AND {stream_pred}
+             ORDER BY ts_ns DESC, stream, idx LIMIT ?3 OFFSET ?4"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![device_param, stream_param, limit, offset], |r| {
             Ok(Record {
                 device: r.get(0)?,
                 stream: r.get(1)?,
@@ -1307,19 +1486,19 @@ impl Store {
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| map_busy(e, "note update"))?;
-        let stored: Option<(String, String, i64, String)> = tx
+        let stored: Option<(String, String, i64, String, String)> = tx
             .query_row(
-                "SELECT hash, payload, version, actor FROM records
+                "SELECT hash, payload, version, actor, extras FROM records
                  WHERE device = ?1 AND stream = 'notes' AND idx = ?2",
                 params![device, idx],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .map(Some)
             .or_else(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(Error::Db(other)),
             })?;
-        let Some((stored, payload, version, actor)) = stored else {
+        let Some((stored, payload, version, actor, extras)) = stored else {
             return Err(Error::NotFound(format!("notes/{idx}")));
         };
         if stored != expected_hash {
@@ -1335,6 +1514,11 @@ impl Store {
                     .map(str::to_string)
             })
             .unwrap_or_default();
+        if id.is_empty() {
+            return Err(Error::InvalidArguments(
+                "note payload lacks id; record is corrupt".to_string(),
+            ));
+        }
         // The mapping must still point here: a concurrent append wins.
         let mapped: Option<i64> = tx
             .query_row(
@@ -1359,8 +1543,8 @@ impl Store {
         )?;
         let (canonical, hash) = note_payload(&id, title, text);
         tx.execute(
-            "INSERT INTO records (device, stream, idx, ts_ns, actor, kind, payload, hash, version)
-             VALUES (?1, 'notes', ?2, ?3, ?4, 'note', ?5, ?6, ?7)",
+            "INSERT INTO records (device, stream, idx, ts_ns, actor, kind, payload, hash, version, extras)
+             VALUES (?1, 'notes', ?2, ?3, ?4, 'note', ?5, ?6, ?7, ?8)",
             params![
                 device,
                 next,
@@ -1368,9 +1552,22 @@ impl Store {
                 actor,
                 canonical,
                 hash,
-                version + 1
+                version + 1,
+                extras
             ],
-        )?;
+        )
+        .map_err(|e| {
+            // Concurrent same-triple writers (sync + note update on cloned
+            // ids) collide on the PK: typed Conflict, not a raw Db error.
+            if let rusqlite::Error::SqliteFailure(f, _) = &e {
+                if f.code == rusqlite::ErrorCode::ConstraintViolation {
+                    return Error::Conflict(format!(
+                        "notes/{next}: concurrent writer; re-read and retry"
+                    ));
+                }
+            }
+            Error::Db(e)
+        })?;
         tx.execute(
             "UPDATE spool_ids SET idx = ?1 WHERE spool_id = ?2 AND device = ?3 AND stream = 'notes'",
             params![next, id, device],
@@ -1475,6 +1672,12 @@ pub fn note_payload(id: &str, title: &str, text: &str) -> (String, String) {
     .to_string();
     let hash = hash_payload(&canonical);
     (canonical, hash)
+}
+
+/// Escape a caller glob for `LIKE ... ESCAPE '\'`: only `%` stays a
+/// wildcard; `\` and `_` match literally.
+fn escape_like(raw: &str) -> String {
+    raw.replace('\\', "\\\\").replace('_', "\\_")
 }
 
 /// blake3 hex of a canonical payload string (dedup hint + integrity).
@@ -1766,9 +1969,34 @@ mod tests {
     fn branches_and_sync_state_roundtrip() {
         let (_tmp, store) = test_store();
         let id = store
-            .branch_put("x", "notes", "d1", 0, "h1", "{\"loser\":true}", "id", 9)
+            .branch_put(
+                "x",
+                "notes",
+                "d1",
+                0,
+                "h1",
+                "{\"loser\":true}",
+                "lh1",
+                "id",
+                9,
+            )
             .unwrap();
-        assert_eq!(id, 1);
+        assert_eq!(id, Some(1));
+        // Same branch twice collapses (concurrent-sync dedupe).
+        let dup = store
+            .branch_put(
+                "x",
+                "notes",
+                "d1",
+                0,
+                "h1",
+                "{\"loser\":true}",
+                "lh1",
+                "id",
+                9,
+            )
+            .unwrap();
+        assert_eq!(dup, None);
         let bs = store.branch_list().unwrap();
         assert_eq!(bs.len(), 1);
         assert_eq!(bs[0].loser_envelope, "{\"loser\":true}");
@@ -1808,11 +2036,11 @@ mod tests {
         for i in 0..3 {
             let mut rec = sample("d2");
             rec.payload = json!({"cmd": format!("r{i}")});
-            assert!(store.apply_remote(&rec, i, &format!("e{i}")).unwrap());
+            assert!(store.apply_remote(&rec, i, &format!("e{i}"), None).unwrap());
         }
         let mut dup = sample("d2");
         dup.payload = json!({"cmd": "r0"});
-        assert!(!store.apply_remote(&dup, 0, "e0").unwrap());
+        assert!(!store.apply_remote(&dup, 0, "e0", None).unwrap());
         assert_eq!(store.max_idx("d2", "shell").unwrap(), 2);
         assert_eq!(store.max_idx("d2", "missing").unwrap(), -1);
         let page = store.records_since("d2", "shell", 0, 10).unwrap();
@@ -2069,5 +2297,124 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, want, "{rel} mode {mode:o}");
         }
+    }
+
+    #[test]
+    fn insert_mapped_foreign_id_is_typed_conflict() {
+        let (_tmp, mut store) = test_store();
+        // Teammate's note claims "deploy" first (as a download would).
+        let mut foreign = sample("d2");
+        foreign.stream = "notes".to_string();
+        foreign.payload = json!({"id": "deploy", "text": "theirs"});
+        foreign.hash = hash_payload(&foreign.payload.to_string());
+        assert!(store.apply_remote(&foreign, 0, "deploy", None).unwrap());
+        // Local write of the same id: typed Conflict, not a raw Db error.
+        let mut local = sample("d1");
+        local.stream = "notes".to_string();
+        local.payload = json!({"id": "deploy", "text": "mine"});
+        local.hash = hash_payload(&local.payload.to_string());
+        let err = store.insert_mapped("deploy", &local).unwrap_err();
+        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+        assert!(err.to_string().contains("d2"), "{err:?}");
+    }
+
+    #[test]
+    fn apply_remote_mapping_loss_branches_immediately() {
+        let (_tmp, mut store) = test_store();
+        let mut a = sample("d1");
+        a.stream = "notes".to_string();
+        a.payload = json!({"id": "deploy", "text": "alpha"});
+        a.hash = hash_payload(&a.payload.to_string());
+        assert!(store.apply_remote(&a, 0, "deploy", None).unwrap());
+        assert!(store.branch_list().unwrap().is_empty());
+        // Second device, same id: record lands AND an id branch files.
+        let mut b = sample("d2");
+        b.stream = "notes".to_string();
+        b.payload = json!({"id": "deploy", "text": "beta"});
+        b.hash = hash_payload(&b.payload.to_string());
+        assert!(store.apply_remote(&b, 0, "deploy", None).unwrap());
+        let bs = store.branch_list().unwrap();
+        assert_eq!(bs.len(), 1);
+        assert_eq!(bs[0].reason, "id");
+        assert_eq!(bs[0].ext_id, "deploy");
+    }
+
+    #[test]
+    fn glob_underscore_is_literal() {
+        let (_tmp, mut store) = test_store();
+        let mut a = sample("d1");
+        a.stream = "transcript:claude".to_string();
+        a.payload = json!({"text": "needle"});
+        store.insert_record(&a).unwrap();
+        let mut b = sample("d1");
+        b.stream = "transcript:claudex".to_string();
+        b.payload = json!({"text": "needle"});
+        store.insert_record(&b).unwrap();
+        // `_` must not act as a single-char wildcard in glob mode.
+        let hits = store
+            .search_stream("d1", "transcript:claude_%", "needle", 10)
+            .unwrap();
+        assert!(hits.is_empty(), "{hits:?}");
+        let hits = store
+            .search_stream("d1", "transcript:claude%", "needle", 10)
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn note_update_preserves_extras() {
+        let (_tmp, mut store) = test_store();
+        let mut n = sample("d1");
+        n.stream = "notes".to_string();
+        n.kind = "note".to_string();
+        n.payload = json!({"id": "k", "title": "t", "text": "v1"});
+        n.hash = hash_payload(&n.payload.to_string());
+        let (idx, _) = store.insert_mapped("k", &n).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE records SET extras = '{\"x\":1}' WHERE device = 'd1' AND stream = 'notes' AND idx = ?1",
+                params![idx],
+            )
+            .unwrap();
+        let (next, _) = store
+            .note_update_guarded("d1", idx, &n.hash, "t", "v2")
+            .unwrap();
+        let extras: String = store
+            .conn
+            .query_row(
+                "SELECT extras FROM records WHERE device = 'd1' AND stream = 'notes' AND idx = ?1",
+                params![next],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(extras, "{\"x\":1}");
+    }
+
+    #[test]
+    fn sync_marks_reset_series_reopens_one_series() {
+        let (_tmp, store) = test_store();
+        store.sync_state_put("https://s", "gen", 1).unwrap();
+        assert_eq!(
+            store.sync_state_list().unwrap(),
+            vec!["https://s".to_string()]
+        );
+        store
+            .sync_marks_set_up("https://s", "d1", "shell", 5)
+            .unwrap();
+        store
+            .sync_marks_set_up("https://s", "d1", "notes", 2)
+            .unwrap();
+        store
+            .sync_marks_reset_series("https://s", "d1", "shell")
+            .unwrap();
+        assert_eq!(
+            store.sync_marks_get("https://s", "d1", "shell").unwrap(),
+            (-1, -1)
+        );
+        assert_eq!(
+            store.sync_marks_get("https://s", "d1", "notes").unwrap().0,
+            2
+        );
     }
 }

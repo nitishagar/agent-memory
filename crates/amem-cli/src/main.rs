@@ -82,6 +82,9 @@ enum Commands {
         /// Pin an unknown server certificate on first contact (TOFU).
         #[arg(long)]
         trust_new: bool,
+        /// Refuse to pin unless the server fingerprint matches (scripted TOFU).
+        #[arg(long)]
+        expect_fingerprint: Option<String>,
     },
     /// Run the self-hosted sync server (TLS-only).
     SyncServer {
@@ -94,6 +97,13 @@ enum Commands {
         /// Generate a self-signed cert into --dir and exit (prints fingerprint).
         #[arg(long)]
         init_cert: bool,
+        /// Allow non-loopback binds (needs --confirm; the MVP server has no
+        /// client auth, so network access = full read/write).
+        #[arg(long)]
+        public: bool,
+        /// Confirm --public.
+        #[arg(long)]
+        confirm: bool,
     },
     /// List conflict branches (JSON).
     Branches,
@@ -117,7 +127,8 @@ enum Commands {
     Mcp,
     /// Export the store as an Obsidian-openable Markdown vault.
     Export {
-        /// Vault directory to write (created; files overwritten).
+        /// Vault directory to write (created; files overwritten). Own-device
+        /// records + own quarantine only (team union export is not in MVP).
         #[arg(long)]
         vault: PathBuf,
     },
@@ -470,13 +481,20 @@ fn run() -> Result<()> {
             recover,
             confirm,
             trust_new,
+            expect_fingerprint,
         }) => {
             if recover && !confirm {
                 return Err(Error::InvalidArguments(
                     "--recover needs --confirm: it adopts the server generation and re-pushes local records".to_string(),
                 ));
             }
-            let s = amem_sync::run_sync(&store, &endpoint, recover, trust_new)?;
+            let s = amem_sync::run_sync(
+                &store,
+                &endpoint,
+                recover,
+                trust_new,
+                expect_fingerprint.as_deref(),
+            )?;
             println!(
                 "{{\"uploaded\":{},\"downloaded\":{},\"duplicates\":{},\"conflicts\":{},\"quarantined\":{},\"branches\":{}}}",
                 s.uploaded, s.downloaded, s.duplicates, s.conflicts, s.quarantined, s.branches
@@ -487,11 +505,21 @@ fn run() -> Result<()> {
             dir,
             listen,
             init_cert,
+            public,
+            confirm,
         }) => {
             if init_cert {
                 let fp = amem_sync_server::cert::init_cert(&dir)?;
                 println!("{{\"fingerprint\":\"{fp}\"}}");
                 return Ok(());
+            }
+            let loopback = amem_sync_server::server::listen_is_loopback(&listen);
+            if !loopback && (!public || !confirm) {
+                return Err(Error::InvalidArguments(
+                    "refusing non-loopback bind without --public --confirm: the MVP sync server \
+                     has no client auth, so anyone reaching it can read/write the whole union"
+                        .to_string(),
+                ));
             }
             amem_sync_server::server::serve_blocking(&dir, &listen)
         }

@@ -64,3 +64,7 @@ pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
 
 /// Largest POST batch the server accepts.
 pub const MAX_BATCH: usize = 100;
+
+/// Largest series index the server accepts (`2^62`: far past any real
+/// series, far below `i64::MAX` so `down + 1` can never overflow).
+pub const MAX_IDX: i64 = 1 << 62;

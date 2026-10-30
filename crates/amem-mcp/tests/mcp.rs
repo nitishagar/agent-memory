@@ -86,7 +86,7 @@ fn recorder_streams_reject_mutation() {
     assert_eq!(err.code(), "INVALID_ARGUMENTS");
     // Recorder data intact.
     assert!(
-        mem.search("cargo build", None, 10, Format::Text)
+        mem.search("cargo build", None, None, 10, Format::Text)
             .unwrap()
             .contains("cargo build")
     );
@@ -199,17 +199,69 @@ fn context_brief_recalls_seeded_events() {
 #[test]
 fn search_and_list_json_shapes_parse() {
     let (_tmp, _dir, mem) = seeded();
-    let js = mem.search("cargo", None, 10, Format::Json).unwrap();
+    let js = mem.search("cargo", None, None, 10, Format::Json).unwrap();
     let v: serde_json::Value = serde_json::from_str(&js).unwrap();
     assert_eq!(v["results"].as_array().unwrap().len(), 2);
     assert!(v["results"][0]["checksum"].is_string());
-    let js = mem.list(Some("shell"), 1, 1, Format::Json).unwrap();
+    let js = mem.list(Some("shell"), None, 1, 1, Format::Json).unwrap();
     let v: serde_json::Value = serde_json::from_str(&js).unwrap();
     assert_eq!(v["results"].as_array().unwrap().len(), 1);
     assert_eq!(v["offset"], 1);
     assert!(
-        mem.list(None, 10, 0, Format::Text)
+        mem.list(None, None, 10, 0, Format::Text)
             .unwrap()
             .contains("cargo test")
     );
+}
+
+#[test]
+fn read_reaches_synced_foreign_records() {
+    let (_tmp, dir, mem) = seeded();
+    // Foreign record, as a sync download would plant it.
+    let mut db = store::Store::open(&dir).unwrap();
+    let payload = json!({"cmd": "teammate-cmd", "exit": 0});
+    let rec = NewRecord {
+        device: "foreign-dev".to_string(),
+        stream: "shell".to_string(),
+        ts_ns: 1_700_000_000_000_000_009,
+        actor: "t:u".to_string(),
+        kind: "command".to_string(),
+        payload: payload.clone(),
+        hash: store::hash_payload(&payload.to_string()),
+    };
+    db.apply_remote(&rec, 0, "foreign-spool-1", None).unwrap();
+    drop(db);
+    // Search finds it (union-wide) AND read opens it (search→read unbroken).
+    let hits = mem
+        .search("teammate-cmd", None, None, 10, Format::Json)
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&hits).unwrap();
+    assert_eq!(v["results"][0]["device"], "foreign-dev");
+    let id = v["results"][0]["id"].as_str().unwrap().to_string();
+    let body = mem.read(&id, None, Format::Text).unwrap();
+    assert!(body.contains("teammate-cmd"), "{body}");
+    assert!(body.contains("foreign-dev"), "{body}");
+}
+
+#[test]
+fn stale_note_versions_flagged_superseded() {
+    let (_tmp, _dir, mem) = seeded();
+    mem.write(Some("nn"), "t", "v1", None, Format::Text)
+        .unwrap();
+    let sum = checksum_of(&mem, "nn");
+    mem.write(Some("nn"), "t", "v2", Some(&sum), Format::Text)
+        .unwrap();
+    let hits = mem
+        .search("nn", Some("notes"), None, 10, Format::Json)
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&hits).unwrap();
+    assert_eq!(v["results"].as_array().unwrap().len(), 2);
+    // Newest first: current v2, then superseded v1.
+    assert_eq!(v["results"][0]["superseded"], false);
+    assert_eq!(v["results"][1]["superseded"], true);
+    assert_eq!(v["results"][0]["id"], "nn");
+    let text = mem
+        .search("nn", Some("notes"), None, 10, Format::Text)
+        .unwrap();
+    assert!(text.contains("(superseded)"), "{text}");
 }

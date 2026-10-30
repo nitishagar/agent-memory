@@ -49,7 +49,13 @@ pub fn export_vault(store_dir: &Path, vault: &Path) -> Result<Stats> {
             .unwrap_or_else(|| format!("{}#{}", rec.stream, rec.idx));
         items.push((rec, ext, false));
     }
+    // Quarantine matches the records scope (own device only): teammates'
+    // synced records are absent from this export, so their quarantined
+    // scraps must not appear either.
     for q in db.quarantine_list()? {
+        if q.device != device {
+            continue;
+        }
         if let Some((rec, ext)) = quarantine_pseudo(&q) {
             items.push((rec, ext, true));
         }

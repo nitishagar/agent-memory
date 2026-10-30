@@ -209,3 +209,268 @@ fn batch_atomic_rejects_whole_batch() {
         .unwrap();
     assert_eq!((ok.accepted, ok.duplicates), (1, 0));
 }
+
+#[tokio::test]
+async fn junk_page_is_protocol_violation_not_hang() {
+    let (tmp, sim) = setup();
+    let dir_a = tmp.path().join("a");
+    let dir_b = tmp.path().join("b");
+    common::seed_shell(&dir_a, 2, "a");
+    common::seed_shell(&dir_b, 1, "b");
+    SyncClient::open(&dir_a, EP, sim.clone())
+        .unwrap()
+        .sync(false)
+        .await
+        .unwrap();
+    sim.arm(Faults {
+        junk_page: true,
+        ..Default::default()
+    });
+    let err = SyncClient::open(&dir_b, EP, sim.clone())
+        .unwrap()
+        .sync(false)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("protocol violation"), "{err:?}");
+    // Fault disarmed: retry converges byte-equal.
+    SyncClient::open(&dir_b, EP, sim.clone())
+        .unwrap()
+        .sync(false)
+        .await
+        .unwrap();
+    SyncClient::open(&dir_a, EP, sim.clone())
+        .unwrap()
+        .sync(false)
+        .await
+        .unwrap();
+    let devices = vec![
+        amem_core::store::device_id(&dir_a).unwrap(),
+        amem_core::store::device_id(&dir_b).unwrap(),
+    ];
+    assert_eq!(
+        common::dump(&dir_a, &devices),
+        common::dump(&dir_b, &devices)
+    );
+}
+
+#[tokio::test]
+async fn fail_mid_download_then_converge() {
+    let (tmp, sim) = setup();
+    let dir_a = tmp.path().join("a");
+    let dir_b = tmp.path().join("b");
+    let da = common::seed_shell(&dir_a, 3, "a");
+    let db = common::seed_shell(&dir_b, 1, "b");
+    let devices = vec![da, db];
+    SyncClient::open(&dir_a, EP, sim.clone())
+        .unwrap()
+        .sync(false)
+        .await
+        .unwrap();
+    // B's sync: call 1 = status, 2 = post, 3 = first next() → dies mid-download.
+    sim.arm(Faults {
+        fail_on_call: Some(3),
+        ..Default::default()
+    });
+    let err = SyncClient::open(&dir_b, EP, sim.clone())
+        .unwrap()
+        .sync(false)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("injected failure"), "{err:?}");
+    // Retry converges with no dupes.
+    SyncClient::open(&dir_b, EP, sim.clone())
+        .unwrap()
+        .sync(false)
+        .await
+        .unwrap();
+    SyncClient::open(&dir_a, EP, sim.clone())
+        .unwrap()
+        .sync(false)
+        .await
+        .unwrap();
+    assert_eq!(common::count(&dir_a, &devices), 4);
+    assert_eq!(
+        common::dump(&dir_a, &devices),
+        common::dump(&dir_b, &devices)
+    );
+}
+
+#[tokio::test]
+async fn skew_holds_cursor_and_heals_on_retry() {
+    let (tmp, sim) = setup();
+    let dir_a = tmp.path().join("a");
+    let dir_b = tmp.path().join("b");
+    common::seed_shell(&dir_a, 2, "a");
+    common::seed_shell(&dir_b, 1, "b");
+    SyncClient::open(&dir_a, EP, sim.clone())
+        .unwrap()
+        .sync(false)
+        .await
+        .unwrap();
+    sim.arm(Faults {
+        skew_ms: 100_000_000_000,
+        ..Default::default()
+    });
+    let s = SyncClient::open(&dir_b, EP, sim.clone())
+        .unwrap()
+        .sync(false)
+        .await
+        .unwrap();
+    assert_eq!((s.quarantined, s.downloaded), (2, 0));
+    // Skew holds the cursor (no advance past unapplied records).
+    let db = amem_core::store::Store::open(&dir_b).unwrap();
+    let da = amem_core::store::device_id(&dir_a).unwrap();
+    assert_eq!(db.sync_marks_get(EP, &da, "shell").unwrap().1, -1);
+    drop(db);
+    // Clock heals (fault cleared): retry applies, stale skew filings drop.
+    sim.arm(Faults::default());
+    let s = SyncClient::open(&dir_b, EP, sim.clone())
+        .unwrap()
+        .sync(false)
+        .await
+        .unwrap();
+    assert_eq!(s.downloaded, 2);
+    let db = amem_core::store::Store::open(&dir_b).unwrap();
+    assert!(db.quarantine_list().unwrap().is_empty());
+    assert_eq!(
+        db.search_stream(
+            &amem_core::store::device_id(&dir_b).unwrap(),
+            "shell",
+            "a-",
+            10
+        )
+        .unwrap()
+        .len(),
+        0
+    );
+    // Union-wide recall finds the healed records.
+    assert_eq!(db.search_stream("%", "shell", "a-", 10).unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn oversize_upload_quarantines_locally_and_proceeds() {
+    use amem_core::store::{self, NewRecord};
+    let (tmp, sim) = setup();
+    let dir_a = tmp.path().join("a");
+    common::seed_shell(&dir_a, 1, "a");
+    let mut db = store::Store::open(&dir_a).unwrap();
+    let device = store::device_id(&dir_a).unwrap();
+    let big = serde_json::json!({"cmd": "x".repeat(2 * 1024 * 1024), "exit": 0});
+    let rec = NewRecord {
+        device: device.clone(),
+        stream: "shell".to_string(),
+        ts_ns: 1_700_000_000_000_000_001,
+        actor: "t:u".to_string(),
+        kind: "command".to_string(),
+        payload: big.clone(),
+        hash: store::hash_payload(&big.to_string()),
+    };
+    db.insert_mapped("big-spool", &rec).unwrap();
+    // One more small record AFTER the poison: sync must reach it.
+    let small = serde_json::json!({"cmd": "after-poison", "exit": 0});
+    let rec = NewRecord {
+        device: device.clone(),
+        stream: "shell".to_string(),
+        ts_ns: 1_700_000_000_000_000_002,
+        actor: "t:u".to_string(),
+        kind: "command".to_string(),
+        payload: small.clone(),
+        hash: store::hash_payload(&small.to_string()),
+    };
+    db.insert_mapped("small-spool", &rec).unwrap();
+    drop(db);
+    let s = SyncClient::open(&dir_a, EP, sim.clone())
+        .unwrap()
+        .sync(false)
+        .await
+        .unwrap();
+    assert_eq!(s.quarantined, 1);
+    assert_eq!(s.uploaded, 2);
+    // Second sync: poison stays shelved, nothing re-sends.
+    let s = SyncClient::open(&dir_a, EP, sim.clone())
+        .unwrap()
+        .sync(false)
+        .await
+        .unwrap();
+    assert_eq!((s.uploaded, s.quarantined), (0, 0));
+    let db = store::Store::open(&dir_a).unwrap();
+    let q = db.quarantine_list().unwrap();
+    assert_eq!(q.len(), 1);
+    assert!(q[0].reason.contains("oversize"), "{:?}", q[0].reason);
+}
+
+#[tokio::test]
+async fn quarantine_stays_quarantined_across_recover() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sim = SimulatedTransport::open(&tmp.path().join("server.db")).unwrap();
+    let dir_a = tmp.path().join("a");
+    let dir_b = tmp.path().join("b");
+    let da = common::seed_shell(&dir_a, 2, "a");
+    common::seed_shell(&dir_b, 1, "b");
+    SyncClient::open(&dir_a, EP, sim.clone())
+        .unwrap()
+        .sync(false)
+        .await
+        .unwrap();
+    SyncClient::open(&dir_b, EP, sim.clone())
+        .unwrap()
+        .sync(false)
+        .await
+        .unwrap();
+    // B shelves one of A's records.
+    let mut db = amem_core::store::Store::open(&dir_b).unwrap();
+    let rec = db.get_record(&da, "shell", 0).unwrap();
+    let ext = db.external_id(&da, "shell", 0).unwrap().unwrap();
+    let env = amem_sync::envelope::Envelope::from_record(&rec, &ext)
+        .unwrap()
+        .to_raw();
+    db.quarantine_move(&da, "shell", 0, &env, "manual", 7)
+        .unwrap();
+    drop(db);
+    // Wipe + both recover: B must NOT resurrect the shelved record.
+    let sim2 = SimulatedTransport::open(&tmp.path().join("server2.db")).unwrap();
+    SyncClient::open(&dir_a, EP, sim2.clone())
+        .unwrap()
+        .sync(true)
+        .await
+        .unwrap();
+    SyncClient::open(&dir_b, EP, sim2.clone())
+        .unwrap()
+        .sync(true)
+        .await
+        .unwrap();
+    let db = amem_core::store::Store::open(&dir_b).unwrap();
+    assert!(matches!(
+        db.get_record(&da, "shell", 0),
+        Err(amem_core::error::Error::NotFound(_))
+    ));
+    assert_eq!(db.quarantine_list().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn post_rejects_negative_and_huge_idx() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut core = ServerCore::open(&dir.path().join("u.db")).unwrap();
+    let payload = serde_json::json!({"cmd": "x"});
+    let hash = amem_core::store::hash_payload(&payload.to_string());
+    for idx in [-1i64, (1i64 << 62) + 1] {
+        let raw = serde_json::json!({
+            "id": "e", "device": "d", "stream": "shell", "idx": idx,
+            "hlc": {"wall_ms": 1_700_000_000_000i64, "ctr": 0, "node": "d"},
+            "ts_ns": 1_700_000_000_000_000_000i64, "actor": "t:u", "kind": "command",
+            "payload": payload, "hash": hash, "v": 1,
+        })
+        .to_string();
+        let err = core
+            .post(&PostBody {
+                records: vec![raw],
+                client_caps: vec![],
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("out of bounds"),
+            "{err:?} idx={idx}"
+        );
+    }
+    assert!(core.status().unwrap().streams.is_empty());
+}

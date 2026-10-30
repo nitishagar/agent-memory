@@ -24,10 +24,21 @@ pub fn resolve_triple(db: &Store, id: &str) -> Result<(String, String, i64)> {
             let (device, stream, idx, _) = hits.into_iter().next().unwrap();
             Ok((device, stream, idx))
         }
-        _ => Err(Error::Ambiguous(format!(
-            "{id}: in {} places; use device/stream/idx",
-            hits.len()
-        ))),
+        _ => {
+            let mut show: Vec<String> = hits
+                .iter()
+                .take(5)
+                .map(|(d, s, i, _)| format!("{d}/{s}/{i}"))
+                .collect();
+            if hits.len() > 5 {
+                show.push(format!("… and {} more", hits.len() - 5));
+            }
+            Err(Error::Ambiguous(format!(
+                "{id}: in {} places ({}); use device/stream/idx",
+                hits.len(),
+                show.join(", ")
+            )))
+        }
     }
 }
 
@@ -59,6 +70,7 @@ pub fn quarantine(store_dir: &Path, id: Option<&str>, reason: &str) -> Result<()
             .map(|q| {
                 serde_json::json!({
                     "triple": format!("{}/{}/{}", q.device, q.stream, q.idx),
+                    "id": envelope_id(&q.envelope),
                     "reason": q.reason, "ts_ns": q.ts_ns,
                 })
             })
@@ -71,7 +83,21 @@ pub fn quarantine(store_dir: &Path, id: Option<&str>, reason: &str) -> Result<()
     let ext = db
         .external_id(&device, &stream, idx)?
         .unwrap_or_else(|| format!("{stream}#{idx}"));
-    let envelope = amem_sync::envelope::Envelope::from_record(&rec, &ext)?.to_raw();
+    // A corrupt row is the MAIN quarantine use case: when the envelope
+    // builder refuses (hash mismatch), file a manual envelope preserving
+    // the fields instead of failing.
+    let envelope = match amem_sync::envelope::Envelope::from_record(&rec, &ext) {
+        Ok(env) => env.to_raw(),
+        Err(_) => serde_json::json!({
+            "id": ext, "device": rec.device, "stream": rec.stream,
+            "idx": idx, "ts_ns": rec.ts_ns, "actor": rec.actor,
+            "kind": rec.kind,
+            "payload": serde_json::from_str::<serde_json::Value>(&rec.payload)
+                .unwrap_or(serde_json::Value::Null),
+            "hash": rec.hash, "v": 1,
+        })
+        .to_string(),
+    };
     db.quarantine_move(&device, &stream, idx, &envelope, reason, now_ns())?;
     println!(
         "{}",
@@ -92,6 +118,22 @@ pub fn unquarantine(store_dir: &Path, id: &str) -> Result<()> {
             "quarantined envelope fails hash check; refusing to restore".to_string(),
         ));
     }
+    // The envelope must name the triple it was filed under: mixed-triple
+    // restores would plant a record the cursors never account for.
+    if env.device != target.device || env.stream != target.stream || env.idx != target.idx {
+        return Err(Error::InvalidArguments(format!(
+            "quarantined envelope names {}/{}/{} but was filed under {}/{}/{}; refusing to restore",
+            env.device, env.stream, env.idx, target.device, target.stream, target.idx,
+        )));
+    }
+    // Skew re-check: a future-dated envelope restored into recall would
+    // sort first forever. Fix the clock (or the data), then retry.
+    let now_ms = now_ns().div_euclid(1_000_000);
+    if let Some(excess) = amem_sync::envelope::future_skew_ms(env.hlc.wall_ms, now_ms) {
+        return Err(Error::InvalidArguments(format!(
+            "quarantined envelope is {excess}ms future-dated; refusing to restore into recall"
+        )));
+    }
     let rec = NewRecord {
         device: env.device.clone(),
         stream: env.stream.clone(),
@@ -103,6 +145,17 @@ pub fn unquarantine(store_dir: &Path, id: &str) -> Result<()> {
     };
     match db.quarantine_restore(&target.device, &target.stream, target.idx, &rec, &env.id) {
         Ok(()) => {
+            // Restored id may now collide with a teammate's same-id note:
+            // branch the divergence like a download would.
+            branch_restored_conflicts(&db, &env, &target.envelope)?;
+            // A below-water restore re-opens its upload series on every
+            // endpoint (else the idx is a permanent server hole).
+            for endpoint in db.sync_state_list()? {
+                let (up, _) = db.sync_marks_get(&endpoint, &target.device, &target.stream)?;
+                if up >= target.idx {
+                    db.sync_marks_reset_series(&endpoint, &target.device, &target.stream)?;
+                }
+            }
             println!(
                 "{}",
                 serde_json::json!({"restored": format!("{}/{}/{}", target.device, target.stream, target.idx)})
@@ -113,6 +166,7 @@ pub fn unquarantine(store_dir: &Path, id: &str) -> Result<()> {
             // Divergent occupant wins the triple; the restored envelope is
             // preserved as a branch (no-loss), then the quarantine row drops.
             let occupant = db.get_record(&target.device, &target.stream, target.idx)?;
+            let loser_hash = amem_core::store::hash_payload(&target.envelope);
             let branch_id = db.branch_put(
                 &env.id,
                 &env.stream,
@@ -120,6 +174,7 @@ pub fn unquarantine(store_dir: &Path, id: &str) -> Result<()> {
                 target.idx,
                 &occupant.hash,
                 &target.envelope,
+                &loser_hash,
                 "restore",
                 now_ns(),
             )?;
@@ -134,6 +189,69 @@ pub fn unquarantine(store_dir: &Path, id: &str) -> Result<()> {
     }
 }
 
+/// After a restore, flag same-id divergences the download path would have
+/// branched (deduped against existing branches).
+fn branch_restored_conflicts(
+    db: &Store,
+    env: &amem_sync::envelope::Envelope,
+    loser_envelope: &str,
+) -> Result<()> {
+    if env.id.is_empty() {
+        return Ok(());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for b in db.branch_list()? {
+        seen.insert((
+            b.stream.clone(),
+            b.winner_device.clone(),
+            b.winner_idx,
+            b.winner_hash.clone(),
+            b.loser_hash.clone(),
+            b.reason.clone(),
+        ));
+    }
+    let loser_hash = amem_core::store::hash_payload(loser_envelope);
+    for (hit_device, hit_stream, hit_idx, hit_hash) in
+        db.resolve_external_any(&env.id, Some(&env.stream))?
+    {
+        if (hit_device == env.device && hit_stream == env.stream && hit_idx == env.idx)
+            || hit_hash == env.hash
+        {
+            continue;
+        }
+        let key = (
+            env.stream.clone(),
+            hit_device.clone(),
+            hit_idx,
+            hit_hash.clone(),
+            loser_hash.clone(),
+            "id".to_string(),
+        );
+        if seen.insert(key) {
+            db.branch_put(
+                &env.id,
+                &env.stream,
+                &hit_device,
+                hit_idx,
+                &hit_hash,
+                loser_envelope,
+                &loser_hash,
+                "id",
+                now_ns(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort envelope id (quarantine list + lookup).
+fn envelope_id(envelope: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(envelope)
+        .ok()
+        .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_string))
+        .unwrap_or_default()
+}
+
 /// Find a quarantine row by triple or by envelope id.
 fn find_quarantined(db: &Store, id: &str) -> Result<amem_core::store::Quarantined> {
     if let Some((device, rest)) = id.split_once('/') {
@@ -145,21 +263,28 @@ fn find_quarantined(db: &Store, id: &str) -> Result<amem_core::store::Quarantine
     }
     let mut hits = Vec::new();
     for q in db.quarantine_list()? {
-        let env_id = serde_json::from_str::<serde_json::Value>(&q.envelope)
-            .ok()
-            .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_string))
-            .unwrap_or_default();
-        if env_id == id {
+        if envelope_id(&q.envelope) == id {
             hits.push(q);
         }
     }
     match hits.len() {
         0 => Err(Error::NotFound(id.to_string())),
         1 => Ok(hits.into_iter().next().unwrap()),
-        _ => Err(Error::Ambiguous(format!(
-            "{id}: quarantined {} times; use device/stream/idx",
-            hits.len()
-        ))),
+        _ => {
+            let mut show: Vec<String> = hits
+                .iter()
+                .take(5)
+                .map(|q| format!("{}/{}/{}", q.device, q.stream, q.idx))
+                .collect();
+            if hits.len() > 5 {
+                show.push(format!("… and {} more", hits.len() - 5));
+            }
+            Err(Error::Ambiguous(format!(
+                "{id}: quarantined {} times ({}); use device/stream/idx",
+                hits.len(),
+                show.join(", ")
+            )))
+        }
     }
 }
 
@@ -172,4 +297,55 @@ fn open_store(store_dir: &Path) -> Result<Store> {
 
 fn now_ns() -> i64 {
     amem_core::clock::now_nanos()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Below-water restore re-opens the upload series (P0-3: no permanent
+    /// server hole), while above-water series are untouched.
+    #[test]
+    fn unquarantine_resets_below_water_marks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("s");
+        let db = Store::open(&store).unwrap();
+        let device = amem_core::store::device_id(&store).unwrap();
+        for (stream, idx) in [("shell", 0i64), ("shell", 1), ("notes", 0)] {
+            let payload = serde_json::json!({"cmd": format!("c{idx}")});
+            let rec = NewRecord {
+                device: device.clone(),
+                stream: stream.to_string(),
+                ts_ns: 1_700_000_000_000_000_000 + idx,
+                actor: "t:u".to_string(),
+                kind: "command".to_string(),
+                payload: payload.clone(),
+                hash: amem_core::store::hash_payload(&payload.to_string()),
+            };
+            db.insert_pinned(&rec, idx).unwrap();
+        }
+        // Pretend a sync happened: marks above the shell hole.
+        db.sync_state_put("https://s", "gen", 1).unwrap();
+        db.sync_marks_set_up("https://s", &device, "shell", 1)
+            .unwrap();
+        db.sync_marks_set_up("https://s", &device, "notes", 0)
+            .unwrap();
+        drop(db);
+
+        // Quarantine shell/0 (the hole), then restore it.
+        quarantine(&store, Some(&format!("{device}/shell/0")), "test").unwrap();
+        unquarantine(&store, &format!("{device}/shell/0")).unwrap();
+
+        let db = Store::open(&store).unwrap();
+        // shell series re-opened (re-upload is idempotent); notes untouched.
+        assert_eq!(
+            db.sync_marks_get("https://s", &device, "shell").unwrap(),
+            (-1, -1)
+        );
+        assert_eq!(
+            db.sync_marks_get("https://s", &device, "notes").unwrap().0,
+            0
+        );
+        assert!(db.get_record(&device, "shell", 0).is_ok());
+    }
 }

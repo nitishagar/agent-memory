@@ -33,17 +33,27 @@ async fn generation_change_refuses_then_recovers() {
     assert!(msg.contains("local=4"), "{msg}");
     assert!(msg.contains("remote=0"), "{msg}");
 
-    // `--recover` re-pushes own records (hosts write their own store).
+    // `--recover` re-pushes ALL local series (own 2 + foreign 2), so the
+    // rebuilt union is complete even if B never comes back.
     let s = a2.sync(true).await.unwrap();
-    assert_eq!(s.uploaded, 2);
+    assert_eq!(s.uploaded, 4);
     assert_eq!(s.downloaded, 0);
+
+    // A fresh client pulls the full rebuilt union from A's re-push alone.
+    let dir_c = tmp.path().join("c");
+    amem_core::store::Store::open(&dir_c).unwrap();
+    let c = SyncClient::open(&dir_c, EP, sim2.clone()).unwrap();
+    let s = c.sync(false).await.unwrap();
+    assert_eq!(s.downloaded, 4);
 
     // B still refuses (it pins the old generation) until its own recover.
     let b2 = SyncClient::open(&dir_b, EP, sim2.clone()).unwrap();
     let err = b2.sync(false).await.unwrap_err();
     assert!(err.to_string().contains("divergence"), "{err:?}");
     let s = b2.sync(true).await.unwrap();
-    assert_eq!(s.uploaded, 2);
+    // Everything B holds is already on the server (via A's re-push).
+    assert_eq!(s.uploaded, 0);
+    assert_eq!(s.duplicates, 4);
     // B already held A's records from before the wipe: nothing new to pull.
     assert_eq!(s.downloaded, 0);
 

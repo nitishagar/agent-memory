@@ -126,14 +126,14 @@ else
   fail "wipe not detected"
 fi
 out=$(AMEM_STORE_DIR="$sta" "$AMEM_BIN" sync --endpoint "$EP" --recover --confirm 2>/dev/null)
-echo "$out" | grep -q '"uploaded":10003' && pass "recover re-pushes A" || fail "recover A: $out"
+echo "$out" | grep -q '"uploaded":10006' && pass "recover re-pushes A (own+foreign)" || fail "recover A: $out"
 if AMEM_STORE_DIR="$stb" "$AMEM_BIN" sync --endpoint "$EP" 2>&1 | grep -q "divergence"; then
   pass "B still refuses until its recover"
 else
   fail "B premature merge"
 fi
 out=$(AMEM_STORE_DIR="$stb" "$AMEM_BIN" sync --endpoint "$EP" --recover --confirm 2>/dev/null)
-echo "$out" | grep -q '"uploaded":3' && pass "recover re-pushes B" || fail "recover B: $out"
+echo "$out" | grep -q '"uploaded":0' && pass "B recover converges (all dups)" || fail "recover B: $out"
 AMEM_STORE_DIR="$sta" "$AMEM_BIN" sync --endpoint "$EP" >/dev/null 2>&1
 dump_union "$sta" > "$home/ua4.txt"
 dump_union "$stb" > "$home/ub4.txt"

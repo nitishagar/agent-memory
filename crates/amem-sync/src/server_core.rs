@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::envelope::Envelope;
-use crate::protocol::{ConflictDto, MAX_BATCH, MAX_RECORD_BYTES, PostBody, PostOutcome, StatusDto};
+use crate::protocol::{
+    ConflictDto, MAX_BATCH, MAX_IDX, MAX_RECORD_BYTES, PostBody, PostOutcome, StatusDto,
+};
 
 /// Union database: raw envelopes keyed by `(device, stream, idx)`.
 pub struct ServerCore {
@@ -49,8 +51,9 @@ impl ServerCore {
                 other => Err(amem_core::error::Error::Db(other)),
             })?;
         if generation.is_none() {
+            // OR IGNORE: concurrent first-opens race here; one wins.
             conn.execute(
-                "INSERT INTO union_meta (key, value) VALUES ('generation', ?1)",
+                "INSERT OR IGNORE INTO union_meta (key, value) VALUES ('generation', ?1)",
                 rusqlite::params![uuid::Uuid::new_v4().to_string()],
             )?;
         }
@@ -151,6 +154,20 @@ impl ServerCore {
                     env.device, env.stream, env.idx
                 )));
             }
+            // Identity bounds: negative/huge idx rows would sit in the
+            // union invisible forever (clients page from 0 and bound by
+            // the status max), and empty names break triple handling.
+            if env.idx < 0 || env.idx > MAX_IDX {
+                return Err(Error::InvalidArguments(format!(
+                    "{}/{}/{}: idx out of bounds; whole batch rejected",
+                    env.device, env.stream, env.idx
+                )));
+            }
+            if env.device.is_empty() || env.stream.is_empty() {
+                return Err(Error::InvalidArguments(
+                    "empty device/stream; whole batch rejected".to_string(),
+                ));
+            }
             parsed.push((env, raw.clone()));
         }
         let tx = self
@@ -198,8 +215,14 @@ impl ServerCore {
 
     /// Truncate the union, KEEPING the generation. Simulator/rollback-test
     /// helper only — models a backup-restore rollback the client must
-    /// refuse. No production route calls this.
-    pub fn truncate_union(&mut self) {
-        let _ = self.conn.execute_batch("DELETE FROM union_records;");
+    /// refuse. No production route calls this. Returns `Result` so a
+    /// failed injection fails the test instead of passing vacuously.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`amem_core::error::Error::Db`] on `SQLite` failure.
+    pub fn truncate_union(&mut self) -> amem_core::error::Result<()> {
+        self.conn.execute_batch("DELETE FROM union_records;")?;
+        Ok(())
     }
 }
