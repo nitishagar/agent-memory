@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use crate::error::Result;
 use crate::transcripts::{
-    ParsedEvent, ReadStats, Role, Source, Warning, is_torn_tail, make_event, parse_iso_ms,
-    read_jsonl_bounded,
+    ParsedEvent, ReadStats, Role, Source, Warning, fallback_seq, fallback_session, is_torn_tail,
+    make_event, parse_iso_ms, read_jsonl_bounded,
 };
 
 /// Parse one rollout file.
@@ -29,7 +29,14 @@ pub fn parse_file(
     let mut events = Vec::new();
     let mut warnings = Vec::new();
     let mut line_no: u64 = 0;
-    let mut session = String::new();
+    // Rollout stems (`rollout-<uuid>`) are unique: pre-meta lines join
+    // them instead of an empty session that would collide across files.
+    let mut session = path
+        .file_stem()
+        .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
+    if session.is_empty() {
+        session = fallback_session(path);
+    }
     let mut project = String::new();
     let mut model: Option<String> = None;
     let stats = read_jsonl_bounded(path, deadline, |line, last| {
@@ -50,6 +57,7 @@ pub fn parse_file(
             project: &mut project,
             model: &mut model,
             line_no,
+            line,
             path,
         };
         parse_line(&value, &mut ctx, &mut events, &mut warnings);
@@ -64,6 +72,7 @@ struct Ctx<'a> {
     project: &'a mut String,
     model: &'a mut Option<String>,
     line_no: u64,
+    line: &'a str,
     path: &'a Path,
 }
 
@@ -71,7 +80,10 @@ impl Ctx<'_> {
     fn seq(&self, v: &serde_json::Value) -> String {
         v.get("ordinal")
             .and_then(serde_json::Value::as_i64)
-            .map_or_else(|| format!("line-{}", self.line_no), |o| format!("ord-{o}"))
+            .map_or_else(
+                || fallback_seq(self.line_no, self.line),
+                |o| format!("ord-{o}"),
+            )
     }
 
     #[allow(clippy::too_many_arguments)]

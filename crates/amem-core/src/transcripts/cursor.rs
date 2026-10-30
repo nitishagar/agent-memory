@@ -9,10 +9,11 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::transcripts::{
-    ParsedEvent, Role, Source, Warning, make_event, open_agent_db, parse_iso_ms,
+    MAX_VALUE_BYTES, ParsedEvent, Role, Source, Warning, make_event, open_agent_db, parse_iso_ms,
 };
 
 /// Session metadata collected from `composerData:<id>` rows.
@@ -22,20 +23,38 @@ struct Composer {
 }
 
 /// Parse one `state.vscdb`. Returns events grouped by composer (caller
-/// sorts globally if needed) plus warnings for unreadable rows.
+/// sorts globally if needed) plus warnings for unreadable rows. Values
+/// over [`MAX_VALUE_BYTES`] skip in-SQL (never materialized); the
+/// `deadline` is honored every thousand rows.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Db`] only when the file is not a database at all.
-/// Missing tables and bad rows degrade to warnings + partial events.
-pub fn parse_db(path: &Path) -> Result<(Vec<ParsedEvent>, Vec<Warning>)> {
+/// Returns [`Error::Db`] when the file is not a database at all and
+/// [`Error::Timeout`] on an expired `deadline`. Missing tables and bad
+/// rows degrade to warnings + partial events.
+pub fn parse_db(path: &Path, deadline: Instant) -> Result<(Vec<ParsedEvent>, Vec<Warning>)> {
     let mut events = Vec::new();
     let mut warnings = Vec::new();
     let conn = open_agent_db(path)?;
     let mut composers: HashMap<String, Composer> = HashMap::new();
     let mut bubbles: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
 
-    let Ok(mut stmt) = conn.prepare("SELECT key, value FROM cursorDiskKV") else {
+    let skipped_large: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM cursorDiskKV WHERE length(value) > ?1",
+            [MAX_VALUE_BYTES],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if skipped_large > 0 {
+        warnings.push(Warning {
+            path: path.to_path_buf(),
+            reason: format!("{skipped_large} oversize values skipped"),
+        });
+    }
+    let Ok(mut stmt) =
+        conn.prepare("SELECT key, value FROM cursorDiskKV WHERE length(value) <= ?1")
+    else {
         warnings.push(Warning {
             path: path.to_path_buf(),
             reason: "cursorDiskKV table missing".to_string(),
@@ -44,7 +63,7 @@ pub fn parse_db(path: &Path) -> Result<(Vec<ParsedEvent>, Vec<Warning>)> {
     };
     // Values are BLOBs on real stores, TEXT in hand-built fixtures:
     // accept both.
-    let rows = stmt.query_map([], |r| {
+    let rows = stmt.query_map([MAX_VALUE_BYTES], |r| {
         let key: String = r.get(0)?;
         let value: rusqlite::types::Value = r.get(1)?;
         let bytes = match value {
@@ -61,7 +80,13 @@ pub fn parse_db(path: &Path) -> Result<(Vec<ParsedEvent>, Vec<Warning>)> {
         });
         return Ok((events, warnings));
     };
-    for row in rows.flatten() {
+    for (n, row) in rows.flatten().enumerate() {
+        if n % 1000 == 0 && Instant::now() > deadline {
+            return Err(Error::Timeout(format!(
+                "transcript pass exceeded deadline on {}",
+                path.display()
+            )));
+        }
         let (key, value) = row;
         // Skip unknown keys before parsing: real stores carry large
         // `composer.content.*` blobs that are never messages.
@@ -80,6 +105,13 @@ pub fn parse_db(path: &Path) -> Result<(Vec<ParsedEvent>, Vec<Warning>)> {
             composers.insert(id.to_string(), composer_of(&parsed));
         } else if let Some(rest) = key.strip_prefix("bubbleId:") {
             if let Some((composer_id, _)) = rest.split_once(':') {
+                if composer_id.is_empty() {
+                    warnings.push(Warning {
+                        path: path.to_path_buf(),
+                        reason: format!("key {key}: empty composer id"),
+                    });
+                    continue;
+                }
                 bubbles
                     .entry(composer_id.to_string())
                     .or_default()
@@ -93,7 +125,7 @@ pub fn parse_db(path: &Path) -> Result<(Vec<ParsedEvent>, Vec<Warning>)> {
     for composer_id in composer_ids {
         let rows = &bubbles[composer_id];
         let composer = composers.get(composer_id);
-        for bubble in order_bubbles(rows, composer) {
+        for bubble in order_bubbles(rows, composer, &mut warnings, path) {
             parse_bubble(
                 composer_id,
                 composer,
@@ -133,13 +165,24 @@ fn composer_of(v: &serde_json::Value) -> Composer {
 
 /// Order bubbles by the composer's header list when present, else by
 /// `createdAt`. Header-unknown bubbles append in `createdAt` order.
+/// Duplicate bubble ids warn (first wins) instead of silently collapsing.
 fn order_bubbles<'a>(
     rows: &'a [serde_json::Value],
     composer: Option<&Composer>,
+    warnings: &mut Vec<Warning>,
+    path: &Path,
 ) -> Vec<&'a serde_json::Value> {
     let mut by_id: HashMap<&str, &serde_json::Value> = HashMap::new();
     for b in rows {
-        by_id.insert(str_field(b, "bubbleId"), b);
+        let id = str_field(b, "bubbleId");
+        if by_id.contains_key(id) {
+            warnings.push(Warning {
+                path: path.to_path_buf(),
+                reason: format!("duplicate bubbleId {id}; first wins"),
+            });
+        } else {
+            by_id.insert(id, b);
+        }
     }
     let mut out = Vec::with_capacity(rows.len());
     if let Some(c) = composer {
@@ -231,7 +274,10 @@ fn parse_bubble(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
+    use crate::transcripts::PASS_DEADLINE;
 
     const BASIC_SQL: &str = include_str!("../../tests/fixtures/transcripts/cursor_basic.sql");
 
@@ -247,7 +293,7 @@ mod tests {
     #[test]
     fn golden_orders_by_headers_and_reads_tools() {
         let (_tmp, path) = db_from_sql(BASIC_SQL);
-        let (events, warnings) = parse_db(&path).unwrap();
+        let (events, warnings) = parse_db(&path, Instant::now() + PASS_DEADLINE).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         // user + assistant + tool bubble (empty text, tool payload).
         assert_eq!(events.len(), 3);
@@ -273,7 +319,7 @@ mod tests {
             .unwrap()
             .execute_batch("CREATE TABLE t(x);")
             .unwrap();
-        let (events, warnings) = parse_db(&path).unwrap();
+        let (events, warnings) = parse_db(&path, Instant::now() + PASS_DEADLINE).unwrap();
         assert!(events.is_empty());
         assert_eq!(warnings.len(), 1);
     }
@@ -283,6 +329,42 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("junk.vscdb");
         std::fs::write(&path, b"definitely not sqlite").unwrap();
-        assert!(parse_db(&path).is_err());
+        assert!(parse_db(&path, Instant::now() + PASS_DEADLINE).is_err());
+    }
+
+    #[test]
+    fn oversize_values_skip_without_reading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("big.vscdb");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cursorDiskKV(key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
+        )
+        .unwrap();
+        let huge_len = usize::try_from(crate::transcripts::MAX_VALUE_BYTES + 1).unwrap();
+        let huge = vec![9u8; huge_len];
+        conn.execute(
+            "INSERT INTO cursorDiskKV VALUES ('bubbleId:c:b', ?1)",
+            rusqlite::params![huge],
+        )
+        .unwrap();
+        drop(conn);
+        let (events, warnings) = parse_db(&path, Instant::now() + PASS_DEADLINE).unwrap();
+        assert!(events.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].reason.contains("oversize"));
+    }
+
+    #[test]
+    fn expired_deadline_aborts() {
+        let (_tmp, path) = db_from_sql(BASIC_SQL);
+        let err = parse_db(
+            &path,
+            Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Timeout(_)));
     }
 }

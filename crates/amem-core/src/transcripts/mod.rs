@@ -130,6 +130,10 @@ pub const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
 /// Maximum event text kept per transcript event; `SQLite` values are
 /// unbounded, so long tool outputs truncate with a marker + full length.
 pub const MAX_EVENT_TEXT_BYTES: usize = 64 * 1024;
+/// Maximum raw `SQLite` value read per row (8MB); larger values skip
+/// with a warning instead of materializing hostile blobs. `i64`: the
+/// `SQLite` integer type.
+pub const MAX_VALUE_BYTES: i64 = 8 * 1024 * 1024;
 /// Wall-clock budget for one ingest pass (5 minutes).
 pub const PASS_DEADLINE: Duration = Duration::from_secs(300);
 
@@ -163,7 +167,7 @@ pub fn read_jsonl_bounded(
     deadline: Instant,
     mut on_line: impl FnMut(&str, bool) -> Result<bool>,
 ) -> Result<ReadStats> {
-    use std::io::{BufRead as _, BufReader};
+    use std::io::BufReader;
     let file = std::fs::File::open(path).map_err(Error::Io)?;
     let mut reader = BufReader::new(file);
     let mut stats = ReadStats::default();
@@ -177,22 +181,20 @@ pub fn read_jsonl_bounded(
             )));
         }
         buf.clear();
-        let n = reader.read_until(b'\n', &mut buf).map_err(Error::Io)?;
-        if n == 0 {
-            break;
+        // Bounded line scan: never buffer past MAX_LINE_BYTES+1, so a
+        // gigabyte newline-free line costs 64KB, not the machine.
+        let (terminated, overlong, consumed) = read_capped_line(&mut reader, &mut buf)?;
+        if consumed == 0 {
+            break; // EOF
         }
-        stats.bytes += n as u64;
+        stats.bytes += consumed;
         if stats.bytes > MAX_FILE_BYTES {
             break;
         }
-        let terminated = buf.ends_with(b"\n");
-        if terminated {
+        if buf.ends_with(b"\r") {
             buf.pop();
-            if buf.ends_with(b"\r") {
-                buf.pop();
-            }
         }
-        if buf.len() > MAX_LINE_BYTES {
+        if overlong {
             stats.skipped += 1;
             continue;
         }
@@ -207,6 +209,51 @@ pub fn read_jsonl_bounded(
         }
     }
     Ok(stats)
+}
+
+/// Read one line, buffering at most `MAX_LINE_BYTES + 1` bytes.
+/// Returns `(saw_newline, line_exceeded_cap, bytes_consumed)`; overlong
+/// lines are consumed through their newline without buffering the excess.
+fn read_capped_line(
+    reader: &mut std::io::BufReader<std::fs::File>,
+    buf: &mut Vec<u8>,
+) -> Result<(bool, bool, u64)> {
+    use std::io::BufRead as _;
+    let mut overlong = false;
+    let mut consumed: u64 = 0;
+    loop {
+        let chunk = reader.fill_buf().map_err(Error::Io)?;
+        if chunk.is_empty() {
+            return Ok((false, overlong, consumed));
+        }
+        if overlong {
+            // Already over cap: discard through the newline.
+            if let Some(i) = chunk.iter().position(|&b| b == b'\n') {
+                reader.consume(i + 1);
+                consumed += (i + 1) as u64;
+                return Ok((true, true, consumed));
+            }
+            let n = chunk.len();
+            reader.consume(n);
+            consumed += n as u64;
+        } else {
+            let room = MAX_LINE_BYTES + 1 - buf.len();
+            let n = chunk.len().min(room);
+            if let Some(i) = chunk[..n].iter().position(|&b| b == b'\n') {
+                buf.extend_from_slice(&chunk[..i]);
+                reader.consume(i + 1);
+                consumed += (i + 1) as u64;
+                return Ok((true, false, consumed));
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            reader.consume(n);
+            consumed += n as u64;
+            if buf.len() > MAX_LINE_BYTES {
+                overlong = true;
+                buf.clear();
+            }
+        }
+    }
 }
 
 /// True when the reader is positioned at end-of-file.
@@ -239,10 +286,43 @@ pub fn truncate_text(text: &str, max_bytes: usize) -> String {
 
 /// Stable dedupe key for one transcript event: re-ingesting a file must
 /// not duplicate records. `seq` is the format-native event id (message
-/// uuid, bubble id, ordinal, or line number as last resort).
+/// uuid, bubble id, ordinal, or line number as last resort). Components
+/// are separator-escaped: `session`/`seq` are attacker-controlled
+/// transcript strings, and `("a", "b:c")` must never collide with
+/// `("a:b", "c")`.
 #[must_use]
 pub fn stable_id(source: Source, session: &str, seq: &str) -> String {
-    format!("ts:{}:{session}:{seq}", source.name())
+    fn esc(s: &str) -> String {
+        s.replace('\\', "\\\\").replace(':', "\\:")
+    }
+    format!("ts:{}:{}:{}", source.name(), esc(session), esc(seq))
+}
+
+/// Fallback session identity from a path: parent directory name plus
+/// file stem. Same-stem files in different project dirs stay distinct.
+#[must_use]
+pub fn fallback_session(path: &std::path::Path) -> String {
+    let stem = path
+        .file_stem()
+        .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    let parent = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    if parent.is_empty() {
+        stem
+    } else {
+        format!("{parent}/{stem}")
+    }
+}
+
+/// Fallback sequence key when a line carries no native id: line number
+/// plus a content hash, so inserting a line above shifts numbers without
+/// duplicating every event below on re-ingest.
+#[must_use]
+pub fn fallback_seq(line_no: u64, line: &str) -> String {
+    let hash = format!("{}", blake3::hash(line.as_bytes()));
+    format!("line-{line_no}-{}", &hash[..8])
 }
 
 /// One parsed event plus its native sequence key (for [`stable_id`]).
@@ -280,25 +360,41 @@ pub fn make_event(
     }
 }
 
+/// Cap on transcript files collected per source per pass: roots are
+/// walked without a visited set, so this bounds hostile fan-out.
+pub const MAX_FILES_PER_SOURCE: usize = 100_000;
+
 /// Find `*.jsonl` transcript files under `root` (recursive to `max_depth`).
 /// Missing roots yield an empty list (source not installed); unreadable
-/// dirs are skipped, never fatal.
+/// dirs are skipped, never fatal. Symlinks are never followed and
+/// non-regular files (FIFOs, sockets) are never returned: a planted FIFO
+/// must not hang the pass, and a planted link must not pull outside
+/// files into the wrong source.
 #[must_use]
 pub fn find_jsonl(root: &std::path::Path, max_depth: usize) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![(root.to_path_buf(), 0)];
     while let Some((dir, depth)) = stack.pop() {
-        if depth > max_depth {
+        if depth > max_depth || out.len() >= MAX_FILES_PER_SOURCE {
             continue;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
+            if out.len() >= MAX_FILES_PER_SOURCE {
+                break;
+            }
             let path = entry.path();
-            if path.is_dir() {
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
                 stack.push((path, depth + 1));
-            } else if path.extension().is_some_and(|e| e == "jsonl") {
+            } else if meta.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
                 out.push(path);
             }
         }
@@ -334,7 +430,13 @@ pub fn parse_iso_ms(text: &str) -> Option<i64> {
     let year: i64 = parts.next()?.parse().ok()?;
     let month: i64 = parts.next()?.parse().ok()?;
     let day: i64 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    // Years outside living memory are hostile or garbage; the bound also
+    // keeps the civil-date arithmetic overflow-free.
+    if parts.next().is_some()
+        || !(1970..=3000).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+    {
         return None;
     }
     // Split time+fraction from zone.
@@ -468,7 +570,10 @@ mod tests {
     #[test]
     fn bounded_reader_enforces_deadline() {
         let (_tmp, path) = tmp_file("d.jsonl", b"{\"a\":1}\n");
-        let err = read_jsonl_bounded(path.as_path(), Instant::now(), |_, _| Ok(true)).unwrap_err();
+        let past = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+        let err = read_jsonl_bounded(path.as_path(), past, |_, _| Ok(true)).unwrap_err();
         assert!(matches!(err, Error::Timeout(_)));
     }
 
@@ -503,6 +608,65 @@ mod tests {
         assert_eq!(parse_iso_ms("not-a-time"), None);
         assert_eq!(parse_iso_ms("2026-13-01T00:00:00Z"), None);
         assert_eq!(parse_iso_ms("2026-10-30 00:00:00"), None);
+    }
+
+    #[test]
+    fn stable_ids_escape_separators() {
+        let a = stable_id(Source::Claude, "a", "b:c");
+        let b = stable_id(Source::Claude, "a:b", "c");
+        assert_ne!(a, b);
+        let c = stable_id(Source::Claude, "a\\", "b");
+        let d = stable_id(Source::Claude, "a", "\\b");
+        assert_ne!(c, d);
+    }
+
+    #[test]
+    fn fallback_seq_binds_content() {
+        let a = fallback_seq(3, "hello");
+        let b = fallback_seq(3, "world");
+        assert_ne!(a, b);
+        assert_eq!(a, fallback_seq(3, "hello"));
+    }
+
+    #[test]
+    fn iso_rejects_absurd_years() {
+        assert_eq!(parse_iso_ms("9999999999999999-01-01T00:00:00Z"), None);
+        assert_eq!(parse_iso_ms("1969-12-31T23:59:59Z"), None);
+        assert_eq!(parse_iso_ms("3001-01-01T00:00:00Z"), None);
+        assert!(parse_iso_ms("2026-01-01T00:00:00Z").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_skips_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let real = root.join("real.jsonl");
+        std::fs::write(&real, "{}\n").unwrap();
+        std::os::unix::fs::symlink(&real, root.join("link.jsonl")).unwrap();
+        std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
+        let found = find_jsonl(&root, 4);
+        assert_eq!(found, vec![real]);
+    }
+
+    #[test]
+    fn giant_line_costs_kilobytes_not_gigabytes() {
+        // 10MB newline-free line: skipped whole, bounded memory.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("giant.jsonl");
+        let mut content = "A".repeat(10 * 1024 * 1024);
+        content.push('\n');
+        content.push_str("{\"ok\":1}\n");
+        std::fs::write(&path, content).unwrap();
+        let mut seen = Vec::new();
+        let stats = read_jsonl_bounded(path.as_path(), Instant::now() + PASS_DEADLINE, |l, _| {
+            seen.push(l.to_string());
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(seen, vec!["{\"ok\":1}"]);
+        assert_eq!(stats.skipped, 1);
     }
 
     #[test]

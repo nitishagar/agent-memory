@@ -44,7 +44,10 @@ fn transcript_dirs() -> Vec<(&'static str, PathBuf)> {
     vec![
         ("claude", home.join(".claude/projects")),
         ("codex", home.join(".codex")),
-        ("cursor", config.join("Cursor/User/workspaceStorage")),
+        (
+            "cursor",
+            config.join("Cursor/User/globalStorage/state.vscdb"),
+        ),
         ("opencode", data.join("opencode")),
         ("pi", home.join(".pi/agent/sessions")),
         ("zcode", home.join(".zcode/cli/db")),
@@ -52,7 +55,8 @@ fn transcript_dirs() -> Vec<(&'static str, PathBuf)> {
 }
 
 fn readable_dir(path: &Path) -> bool {
-    std::fs::read_dir(path).is_ok()
+    // Dirs: listable. Files (cursor's `state.vscdb`): present.
+    std::fs::read_dir(path).is_ok() || path.is_file()
 }
 
 /// Render the full report for `store_dir`. Never fails hard: every probe

@@ -426,9 +426,37 @@ impl Store {
         )?)
     }
 
-    /// Substring search over payloads newest-first. `stream_like` is a
-    /// `LIKE` pattern (`%` = all streams); `text` is matched literally
-    /// (`LIKE` metacharacters escaped). The MCP server builds on this.
+    /// List every record for a device, oldest first. Export walks this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Db`] on `SQLite` failure.
+    pub fn list_all(&self, device: &str) -> Result<Vec<Record>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT device, stream, idx, ts_ns, actor, kind, payload, hash
+             FROM records WHERE device = ?1 ORDER BY ts_ns, stream, idx",
+        )?;
+        let rows = stmt.query_map(params![device], |r| {
+            Ok(Record {
+                device: r.get(0)?,
+                stream: r.get(1)?,
+                idx: r.get(2)?,
+                ts_ns: r.get(3)?,
+                actor: r.get(4)?,
+                kind: r.get(5)?,
+                payload: r.get(6)?,
+                hash: r.get(7)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::Db)
+    }
+
+    /// Substring search over payloads newest-first. `stream` matches
+    /// exactly unless it contains `%` (then it is a `LIKE` glob, `%`
+    /// alone = all streams). `text` is always matched literally (`LIKE`
+    /// metacharacters escaped), so callers cannot widen either filter by
+    /// accident. The MCP server builds on this.
     ///
     /// # Errors
     ///
@@ -445,12 +473,25 @@ impl Store {
             .replace('%', "\\%")
             .replace('_', "\\_");
         let pattern = format!("%{escaped}%");
-        let mut stmt = self.conn.prepare(
-            "SELECT device, stream, idx, ts_ns, actor, kind, payload, hash
-             FROM records WHERE device = ?1 AND stream LIKE ?2
-             AND payload LIKE ?3 ESCAPE '\\' ORDER BY ts_ns DESC LIMIT ?4",
-        )?;
-        let rows = stmt.query_map(params![device, stream_like, pattern, limit], |r| {
+        // Exact stream unless the caller asked for a glob: a restrictive
+        // MCP caller passing `transcript:claude_` must not over-match.
+        let (sql, stream_param) = if stream_like.contains('%') {
+            (
+                "SELECT device, stream, idx, ts_ns, actor, kind, payload, hash
+                 FROM records WHERE device = ?1 AND stream LIKE ?2
+                 AND payload LIKE ?3 ESCAPE '\\' ORDER BY ts_ns DESC LIMIT ?4",
+                stream_like.to_string(),
+            )
+        } else {
+            (
+                "SELECT device, stream, idx, ts_ns, actor, kind, payload, hash
+                 FROM records WHERE device = ?1 AND stream = ?2
+                 AND payload LIKE ?3 ESCAPE '\\' ORDER BY ts_ns DESC LIMIT ?4",
+                stream_like.to_string(),
+            )
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![device, stream_param, pattern, limit], |r| {
             Ok(Record {
                 device: r.get(0)?,
                 stream: r.get(1)?,
@@ -565,6 +606,36 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn search_stream_exact_unless_glob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        let mut a = sample("d1");
+        a.stream = "transcript:claude".to_string();
+        a.payload = json!({"text": "needle here"});
+        store.insert_record(&a).unwrap();
+        let mut b = sample("d1");
+        b.stream = "transcript:claudex".to_string();
+        b.payload = json!({"text": "needle here"});
+        store.insert_record(&b).unwrap();
+        // Underscore must not act as a wildcard in exact mode.
+        let hits = store
+            .search_stream("d1", "transcript:claude_", "needle", 10)
+            .unwrap();
+        assert!(hits.is_empty());
+        let hits = store
+            .search_stream("d1", "transcript:claude", "needle", 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        let hits = store
+            .search_stream("d1", "transcript:%", "needle", 10)
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        // Text metacharacters are literal.
+        let hits = store.search_stream("d1", "%", "need_e", 10).unwrap();
+        assert!(hits.is_empty());
     }
 
     #[test]

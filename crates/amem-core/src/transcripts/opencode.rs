@@ -8,20 +8,31 @@
 //! through this same core via `source`.
 
 use std::path::Path;
+use std::time::Instant;
 
-use crate::error::Result;
-use crate::transcripts::{ParsedEvent, Role, Source, Warning, make_event, open_agent_db};
+use crate::error::{Error, Result};
+use crate::transcripts::{
+    MAX_VALUE_BYTES, ParsedEvent, Role, Source, Warning, make_event, open_agent_db,
+};
 
 /// Parse one session database for `source` (`OpenCode` or `ZCode`).
+/// `data` values over [`MAX_VALUE_BYTES`] skip in-SQL; the `deadline`
+/// is honored per session and per message.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Db`] only when the file is not a database at all.
-/// Missing tables and bad rows degrade to warnings + partial events.
-pub fn parse_db(path: &Path, source: Source) -> Result<(Vec<ParsedEvent>, Vec<Warning>)> {
+/// Returns [`Error::Db`] when the file is not a database at all and
+/// [`Error::Timeout`] on an expired `deadline`. Missing tables and bad
+/// rows degrade to warnings + partial events.
+pub fn parse_db(
+    path: &Path,
+    source: Source,
+    deadline: Instant,
+) -> Result<(Vec<ParsedEvent>, Vec<Warning>)> {
     let mut events = Vec::new();
     let mut warnings = Vec::new();
     let conn = open_agent_db(path)?;
+    warn_oversize(&conn, path, &mut warnings);
     let sessions = match load_sessions(&conn) {
         Ok(s) => s,
         Err(e) => {
@@ -32,8 +43,40 @@ pub fn parse_db(path: &Path, source: Source) -> Result<(Vec<ParsedEvent>, Vec<Wa
             return Ok((events, warnings));
         }
     };
+    let mut msg_stmt = match conn.prepare(
+        "SELECT id, time_created, data FROM message WHERE session_id = ?1
+         AND length(data) <= ?2 ORDER BY time_created, id",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            warnings.push(Warning {
+                path: path.to_path_buf(),
+                reason: format!("message table unreadable: {e}"),
+            });
+            return Ok((events, warnings));
+        }
+    };
+    let mut part_stmt = match conn.prepare(
+        "SELECT id, time_created, data FROM part WHERE message_id = ?1
+         AND length(data) <= ?2 ORDER BY time_created, id",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            warnings.push(Warning {
+                path: path.to_path_buf(),
+                reason: format!("part table unreadable: {e}"),
+            });
+            return Ok((events, warnings));
+        }
+    };
     for session in sessions {
-        let messages = match load_messages(&conn, &session.id) {
+        if Instant::now() > deadline {
+            return Err(Error::Timeout(format!(
+                "transcript pass exceeded deadline on {}",
+                path.display()
+            )));
+        }
+        let messages = match load_messages(&mut msg_stmt, &session.id) {
             Ok(m) => m,
             Err(e) => {
                 warnings.push(Warning {
@@ -44,7 +87,13 @@ pub fn parse_db(path: &Path, source: Source) -> Result<(Vec<ParsedEvent>, Vec<Wa
             }
         };
         for message in messages {
-            let parts = match load_parts(&conn, &message.id) {
+            if Instant::now() > deadline {
+                return Err(Error::Timeout(format!(
+                    "transcript pass exceeded deadline on {}",
+                    path.display()
+                )));
+            }
+            let parts = match load_parts(&mut part_stmt, &message.id) {
                 Ok(p) => p,
                 Err(e) => {
                     warnings.push(Warning {
@@ -68,6 +117,25 @@ pub fn parse_db(path: &Path, source: Source) -> Result<(Vec<ParsedEvent>, Vec<Wa
     Ok((events, warnings))
 }
 
+/// Count oversize `data` values without reading them.
+fn warn_oversize(conn: &rusqlite::Connection, path: &Path, warnings: &mut Vec<Warning>) {
+    for table in ["message", "part"] {
+        let n: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE length(data) > ?1"),
+                [MAX_VALUE_BYTES],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if n > 0 {
+            warnings.push(Warning {
+                path: path.to_path_buf(),
+                reason: format!("{table}: {n} oversize values skipped"),
+            });
+        }
+    }
+}
+
 struct Session {
     id: String,
     directory: String,
@@ -77,12 +145,25 @@ struct Message {
     id: String,
     time_ms: Option<i64>,
     data: serde_json::Value,
+    data_bad: bool,
 }
 
 struct Part {
     id: String,
     time_ms: Option<i64>,
     data: serde_json::Value,
+    data_bad: bool,
+}
+
+fn parse_data(raw: Option<String>) -> (serde_json::Value, bool) {
+    let raw = raw.unwrap_or_default();
+    if raw.trim().is_empty() {
+        return (serde_json::Value::Null, false);
+    }
+    match serde_json::from_str(&raw) {
+        Ok(v) => (v, false),
+        Err(_) => (serde_json::Value::Null, true),
+    }
 }
 
 fn load_sessions(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<Session>> {
@@ -96,31 +177,27 @@ fn load_sessions(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<Session>> 
     rows.collect()
 }
 
-fn load_messages(conn: &rusqlite::Connection, session: &str) -> rusqlite::Result<Vec<Message>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, time_created, data FROM message WHERE session_id = ?1 ORDER BY time_created, id",
-    )?;
-    let rows = stmt.query_map([session], |r| {
-        let data: String = r.get::<_, Option<String>>(2)?.unwrap_or_default();
+fn load_messages(stmt: &mut rusqlite::Statement, session: &str) -> rusqlite::Result<Vec<Message>> {
+    let rows = stmt.query_map(rusqlite::params![session, MAX_VALUE_BYTES], |r| {
+        let (data, data_bad) = parse_data(r.get::<_, Option<String>>(2)?);
         Ok(Message {
             id: r.get(0)?,
             time_ms: r.get::<_, Option<i64>>(1)?,
-            data: serde_json::from_str(&data).unwrap_or(serde_json::Value::Null),
+            data,
+            data_bad,
         })
     })?;
     rows.collect()
 }
 
-fn load_parts(conn: &rusqlite::Connection, message: &str) -> rusqlite::Result<Vec<Part>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, time_created, data FROM part WHERE message_id = ?1 ORDER BY time_created, id",
-    )?;
-    let rows = stmt.query_map([message], |r| {
-        let data: String = r.get::<_, Option<String>>(2)?.unwrap_or_default();
+fn load_parts(stmt: &mut rusqlite::Statement, message: &str) -> rusqlite::Result<Vec<Part>> {
+    let rows = stmt.query_map(rusqlite::params![message, MAX_VALUE_BYTES], |r| {
+        let (data, data_bad) = parse_data(r.get::<_, Option<String>>(2)?);
         Ok(Part {
             id: r.get(0)?,
             time_ms: r.get::<_, Option<i64>>(1)?,
-            data: serde_json::from_str(&data).unwrap_or(serde_json::Value::Null),
+            data,
+            data_bad,
         })
     })?;
     rows.collect()
@@ -139,6 +216,13 @@ fn parse_message(
     warnings: &mut Vec<Warning>,
     path: &Path,
 ) {
+    if message.data_bad {
+        warnings.push(Warning {
+            path: path.to_path_buf(),
+            reason: format!("message {}: unparseable data", message.id),
+        });
+        return;
+    }
     let role = match str_field(&message.data, "role") {
         "user" => Role::User,
         "assistant" => Role::Assistant,
@@ -165,6 +249,13 @@ fn parse_message(
         })
         .map(str::to_string);
     for part in parts {
+        if part.data_bad {
+            warnings.push(Warning {
+                path: path.to_path_buf(),
+                reason: format!("part {}: unparseable data", part.id),
+            });
+            continue;
+        }
         let ts_ms = part.time_ms.or(message.time_ms);
         match str_field(&part.data, "type") {
             "text" => {
@@ -241,7 +332,12 @@ pub(crate) mod tests {
     #[test]
     fn golden_session_message_parts() {
         let (_tmp, path) = db_from_sql(BASIC_SQL);
-        let (events, warnings) = parse_db(&path, Source::Opencode).unwrap();
+        let (events, warnings) = parse_db(
+            &path,
+            Source::Opencode,
+            Instant::now() + crate::transcripts::PASS_DEADLINE,
+        )
+        .unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         // user-text + assistant-text + tool (step-finish skipped).
         assert_eq!(events.len(), 3);
@@ -259,6 +355,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn bad_data_warns_per_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bad.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE session(id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER);
+                 CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+                 CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+                 INSERT INTO session VALUES('s1','/p',999);
+                 INSERT INTO message VALUES('m1','s1',1000,'not json');
+                 INSERT INTO message VALUES('m2','s1',1001,'{\"role\":\"user\"}');
+                 INSERT INTO part VALUES('p1','m2','s1',1001,'also not json');",
+            )
+            .unwrap();
+        let (events, warnings) = parse_db(
+            &path,
+            Source::Opencode,
+            std::time::Instant::now() + crate::transcripts::PASS_DEADLINE,
+        )
+        .unwrap();
+        assert!(events.is_empty());
+        assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
     fn missing_tables_warn_not_error() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("bare.db");
@@ -266,7 +388,12 @@ pub(crate) mod tests {
             .unwrap()
             .execute_batch("CREATE TABLE t(x);")
             .unwrap();
-        let (events, warnings) = parse_db(&path, Source::Opencode).unwrap();
+        let (events, warnings) = parse_db(
+            &path,
+            Source::Opencode,
+            Instant::now() + crate::transcripts::PASS_DEADLINE,
+        )
+        .unwrap();
         assert!(events.is_empty());
         assert_eq!(warnings.len(), 1);
     }

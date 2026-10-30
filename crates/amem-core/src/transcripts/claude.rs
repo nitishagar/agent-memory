@@ -11,8 +11,8 @@ use std::time::Instant;
 
 use crate::error::Result;
 use crate::transcripts::{
-    ParsedEvent, ReadStats, Role, Source, Warning, is_torn_tail, make_event, parse_iso_ms,
-    read_jsonl_bounded,
+    ParsedEvent, ReadStats, Role, Source, Warning, fallback_seq, fallback_session, is_torn_tail,
+    make_event, parse_iso_ms, read_jsonl_bounded,
 };
 
 /// Parse one session file. Returns events (in file order), warnings for
@@ -26,9 +26,7 @@ pub fn parse_file(
     path: &Path,
     deadline: Instant,
 ) -> Result<(Vec<ParsedEvent>, Vec<Warning>, ReadStats)> {
-    let fallback_session = path
-        .file_stem()
-        .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    let fallback_session = fallback_session(path);
     let mut events = Vec::new();
     let mut warnings = Vec::new();
     let mut line_no: u64 = 0;
@@ -49,6 +47,7 @@ pub fn parse_file(
             &value,
             &fallback_session,
             line_no,
+            line,
             &mut events,
             &mut warnings,
             path,
@@ -120,7 +119,7 @@ struct Header {
 }
 
 impl Header {
-    fn of(v: &serde_json::Value, fallback_session: &str, line_no: u64) -> Self {
+    fn of(v: &serde_json::Value, fallback_session: &str, line_no: u64, line: &str) -> Self {
         let s = str_field(v, "sessionId");
         let s = if s.is_empty() {
             str_field(v, "session_id")
@@ -139,7 +138,7 @@ impl Header {
             .and_then(parse_iso_ms);
         let uuid = str_field(v, "uuid");
         let seq = if uuid.is_empty() {
-            format!("line-{line_no}")
+            fallback_seq(line_no, line)
         } else {
             uuid.to_string()
         };
@@ -180,11 +179,12 @@ fn parse_line(
     v: &serde_json::Value,
     fallback_session: &str,
     line_no: u64,
+    line: &str,
     events: &mut Vec<ParsedEvent>,
     warnings: &mut Vec<Warning>,
     path: &Path,
 ) {
-    let header = Header::of(v, fallback_session, line_no);
+    let header = Header::of(v, fallback_session, line_no, line);
     match str_field(v, "type") {
         "user" => parse_user(v, &header, events),
         "assistant" => parse_assistant(v, &header, events),

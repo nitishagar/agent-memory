@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use crate::error::Result;
 use crate::transcripts::{
-    ParsedEvent, ReadStats, Role, Source, Warning, is_torn_tail, make_event, parse_iso_ms,
-    read_jsonl_bounded,
+    ParsedEvent, ReadStats, Role, Source, Warning, fallback_seq, fallback_session, is_torn_tail,
+    make_event, parse_iso_ms, read_jsonl_bounded,
 };
 
 /// Parse one session file.
@@ -30,6 +30,9 @@ pub fn parse_file(
     let mut warnings = Vec::new();
     let mut line_no: u64 = 0;
     let mut session = file_session_id(path);
+    if session.is_empty() {
+        session = fallback_session(path);
+    }
     let mut project = String::new();
     let mut saw_header = false;
     let stats = read_jsonl_bounded(path, deadline, |line, last| {
@@ -61,7 +64,7 @@ pub fn parse_file(
                     }
                 }
             }
-            "message" => parse_message(&value, &session, &project, line_no, &mut events),
+            "message" => parse_message(&value, &session, &project, line_no, line, &mut events),
             "" => {
                 warnings.push(Warning {
                     path: path.to_path_buf(),
@@ -173,6 +176,7 @@ fn parse_message(
     session: &str,
     project: &str,
     line_no: u64,
+    line: &str,
     events: &mut Vec<ParsedEvent>,
 ) {
     let Some(msg) = entry.get("message") else {
@@ -180,7 +184,7 @@ fn parse_message(
     };
     let entry_id = str_field(entry, "id");
     let seq = if entry_id.is_empty() {
-        format!("line-{line_no}")
+        fallback_seq(line_no, line)
     } else {
         entry_id.to_string()
     };

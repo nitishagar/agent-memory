@@ -69,9 +69,9 @@ pub fn ingest_source(
             Source::Claude => super::claude::parse_file(&file, deadline).map(|(e, w, _)| (e, w)),
             Source::Pi => super::pi::parse_file(&file, deadline).map(|(e, w, _)| (e, w)),
             Source::Codex => super::codex::parse_file(&file, deadline).map(|(e, w, _)| (e, w)),
-            Source::Cursor => super::cursor::parse_db(&file),
-            Source::Opencode => super::opencode::parse_db(&file, source),
-            Source::Zcode => super::zcode::parse_db(&file),
+            Source::Cursor => super::cursor::parse_db(&file, deadline),
+            Source::Opencode => super::opencode::parse_db(&file, source, deadline),
+            Source::Zcode => super::zcode::parse_db(&file, deadline),
         };
         let (events, mut file_warnings) = match parsed {
             Ok(pair) => pair,
@@ -121,16 +121,34 @@ fn commit_event(
     let event = &parsed.event;
     let (text, text_redacted) = redactor.redact(&event.text);
     let (project, project_redacted) = redactor.redact(&event.project);
+    // Session/tool/model are free-form transcript strings: a crafted
+    // `tool_use.name` must not smuggle a secret past redaction. Normal
+    // ids never match secret patterns, so identity joins are unaffected.
+    let (session, session_redacted) = redactor.redact(&event.session_id);
+    let (tool, tool_redacted) = event.tool_name.as_deref().map_or_else(
+        || (None, false),
+        |t| {
+            let (r, hit) = redactor.redact(t);
+            (Some(r), hit)
+        },
+    );
+    let (model, model_redacted) = event.model.as_deref().map_or_else(
+        || (None, false),
+        |m| {
+            let (r, hit) = redactor.redact(m);
+            (Some(r), hit)
+        },
+    );
     let payload = serde_json::json!({
         "source": source.name(),
-        "session": event.session_id,
+        "session": session,
         "project": project,
         "role": event.role.name(),
         "text": text,
         "text_len": event.text.len(),
-        "tool": event.tool_name,
-        "model": event.model,
-        "redacted": text_redacted || project_redacted,
+        "tool": tool,
+        "model": model,
+        "redacted": text_redacted || project_redacted || session_redacted || tool_redacted || model_redacted,
     });
     let canonical = payload.to_string();
     let rec = NewRecord {
@@ -256,6 +274,12 @@ mod tests {
         .unwrap();
         assert_eq!(stats, TranscriptStats::default());
         assert!(warnings.is_empty());
-        assert!(cursor::parse_db(std::path::Path::new("/nonexistent")).is_err());
+        assert!(
+            cursor::parse_db(
+                std::path::Path::new("/nonexistent"),
+                Instant::now() + crate::transcripts::PASS_DEADLINE
+            )
+            .is_err()
+        );
     }
 }

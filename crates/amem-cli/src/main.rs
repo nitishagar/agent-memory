@@ -41,7 +41,9 @@ enum Commands {
         #[arg(long, hide = true)]
         crash_after: Option<u64>,
         /// Override one transcript source root (`NAME=PATH`, repeatable).
-        /// Names: claude, codex, cursor, opencode, pi, zcode.
+        /// Names: claude, codex, cursor, opencode, pi, zcode. Roots are
+        /// trusted input: a hostile root is only as dangerous as any
+        /// local file the invoker can already read.
         #[arg(long)]
         transcript_root: Vec<String>,
         /// Skip the transcript pass (spool only).
@@ -207,6 +209,13 @@ fn run_transcripts(
     for o in overrides {
         match o.split_once('=') {
             Some((name, path)) if !name.is_empty() && !path.is_empty() => {
+                if !amem_core::transcripts::Source::all()
+                    .iter()
+                    .any(|s| s.name() == name)
+                {
+                    eprintln!("amem: transcript warn: unknown source '{name}', ignored");
+                    continue;
+                }
                 over.insert(name, path);
             }
             _ => {
@@ -222,7 +231,15 @@ fn run_transcripts(
             .map(std::path::PathBuf::from)
             .or_else(|| amem_core::transcripts::default_root(*source));
         let Some(root) = root else { continue };
-        if !over.contains_key(source.name()) && !root.exists() {
+        if !root.exists() {
+            if over.contains_key(source.name()) {
+                eprintln!(
+                    "amem: transcript warn: {}: explicit root {} missing",
+                    source.name(),
+                    root.display()
+                );
+                stats.transcript_warnings += 1;
+            }
             continue; // Source not installed: silent skip.
         }
         let deadline = Instant::now() + amem_core::transcripts::PASS_DEADLINE;
@@ -235,7 +252,11 @@ fn run_transcripts(
                 stats.transcript_ingested += ts.ingested;
                 stats.transcript_warnings += warnings.len() as u64;
                 for w in warnings {
-                    eprintln!("amem: transcript warn: {}: {}", w.path.display(), w.reason);
+                    eprintln!(
+                        "amem: transcript warn: {}: {}",
+                        sanitize(&w.path.display().to_string()),
+                        sanitize(&w.reason)
+                    );
                 }
             }
             Err(Error::Timeout(e)) => {
@@ -257,9 +278,9 @@ fn render_hit(rec: &amem_core::store::Record) -> String {
     let first_line = |s: &str| {
         let line = s.lines().next().unwrap_or_default();
         if line.chars().count() > 160 {
-            format!("{}…", line.chars().take(160).collect::<String>())
+            sanitize(&format!("{}…", line.chars().take(160).collect::<String>()))
         } else {
-            line.to_string()
+            sanitize(line)
         }
     };
     if rec.stream == "shell" {
@@ -291,17 +312,32 @@ fn render_hit(rec: &amem_core::store::Record) -> String {
         .get("text")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    let short = if session.len() > 8 {
-        &session[..8]
-    } else {
-        session
-    };
+    let short: String = session.chars().take(8).collect();
     format!(
-        "[{} #{}] {short} {role}: {}",
-        source,
+        "[{} #{}] {} {}: {}",
+        sanitize(source),
         rec.idx,
+        sanitize(&short),
+        sanitize(role),
         first_line(text)
     )
+}
+
+/// Sanitize hostile strings for terminal display: control characters
+/// (including ESC and `\r`) become U+FFFD, output capped at 300 chars.
+/// Transcript content is attacker-controlled; logs and hits must not
+/// carry escape sequences or forged lines.
+fn sanitize(s: &str) -> String {
+    let clean: String = s
+        .chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .take(300)
+        .collect();
+    if s.chars().count() > 300 {
+        format!("{clean}…")
+    } else {
+        clean
+    }
 }
 
 /// `ingest --once`: spool pass, then the six-source transcript pass.
@@ -349,8 +385,12 @@ fn cmd_ingest(
 /// `search`: read-only substring search, newest first.
 fn cmd_search(store: &std::path::Path, query: &str, stream: &str, limit: i64) -> Result<()> {
     let limit = limit.clamp(1, 200);
-    let db = amem_core::store::Store::open_readonly(store)
-        .map_err(|_| Error::NotFound("store not initialized; nothing to search".to_string()))?;
+    if !store.join("memory.db").exists() {
+        return Err(Error::NotFound(
+            "store not initialized; nothing to search".to_string(),
+        ));
+    }
+    let db = amem_core::store::Store::open_readonly(store)?;
     let device = std::fs::read_to_string(store.join("device_id"))
         .map(|d| d.trim().to_string())
         .unwrap_or_default();

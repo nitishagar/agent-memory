@@ -305,19 +305,81 @@ fn search_finds_seeded_command() {
     assert!(String::from_utf8(out.stdout).unwrap().is_empty());
 }
 
-fn start_via_stdin(store: &str, shell: &str, cmd_bytes: &[u8]) -> String {
-    use std::io::Write as _;
-    use std::process::Stdio;
-    let mut child = amem()
+#[test]
+fn search_survives_hostile_transcript_session_and_escapes() {
+    // Multibyte session (byte 8 splits a char), ESC/CR in text: search
+    // must not panic and must not emit raw controls.
+    let (tmp, store) = temp_store("s13");
+    let store_s = store.to_str().unwrap().to_string();
+    let root = tmp.path().join("claude");
+    std::fs::create_dir_all(root.join("slug")).unwrap();
+    // é = 2 bytes: byte 8 splits the 4th char.
+    let line = serde_json::json!({"type":"user",
+        "message":{"role":"user","content":"escape-me-\u{1b}]0;pwned\u{7}argent\r"},
+        "uuid":"aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa",
+        "timestamp":"2026-10-30T00:00:00.000Z",
+        "sessionId":"éééééééééé","cwd":"/p"})
+    .to_string();
+    std::fs::write(root.join("slug").join("s.jsonl"), format!("{line}\n")).unwrap();
+    let st = amem()
         .args([
             "--store-dir",
-            store,
-            "history",
-            "start",
-            "--shell",
-            shell,
-            "--cmd-from-stdin",
+            &store_s,
+            "ingest",
+            "--once",
+            "--transcript-root",
+            &format!("claude={}", root.display()),
+            "--transcript-root",
+            "codex=/nonexistent-codex",
+            "--transcript-root",
+            "cursor=/nonexistent-cursor",
+            "--transcript-root",
+            "opencode=/nonexistent-opencode",
+            "--transcript-root",
+            "pi=/nonexistent-pi",
+            "--transcript-root",
+            "zcode=/nonexistent-zcode",
         ])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let out = amem()
+        .args(["--store-dir", &store_s, "search", "escape-me"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = out.stdout;
+    assert!(!stdout.is_empty(), "hostile record not found");
+    assert!(!stdout.contains(&0x1b), "ESC leaked to terminal");
+    assert!(!stdout.contains(&b'\r'), "CR leaked to terminal");
+}
+
+fn start_via_stdin(store: &str, shell: &str, cmd_bytes: &[u8]) -> String {
+    start_via_stdin_session(store, shell, cmd_bytes, None)
+}
+
+fn start_via_stdin_session(
+    store: &str,
+    shell: &str,
+    cmd_bytes: &[u8],
+    session: Option<&str>,
+) -> String {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let mut cmd = amem();
+    cmd.args([
+        "--store-dir",
+        store,
+        "history",
+        "start",
+        "--shell",
+        shell,
+        "--cmd-from-stdin",
+    ]);
+    if let Some(s) = session {
+        cmd.env("AMEM_SESSION", s);
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()

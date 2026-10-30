@@ -97,7 +97,7 @@ mod tests {
         }
         assert!(path.metadata().unwrap().len() >= 200 * 1024 * 1024);
         let start = Instant::now();
-        let (events, warnings) = cursor::parse_db(&path).unwrap();
+        let (events, warnings) = cursor::parse_db(&path, Instant::now() + PASS_DEADLINE).unwrap();
         assert!(start.elapsed() < std::time::Duration::from_secs(60));
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(events.len(), 1);
@@ -143,7 +143,7 @@ mod tests {
             )
             .unwrap();
         }
-        let (events, warnings) = cursor::parse_db(&path).unwrap();
+        let (events, warnings) = cursor::parse_db(&path, Instant::now() + PASS_DEADLINE).unwrap();
         assert!(events.is_empty());
         assert!(!warnings.is_empty());
     }
@@ -153,7 +153,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("d.jsonl");
         std::fs::write(&path, "{}\n").unwrap();
-        let err = read_jsonl_bounded(&path, Instant::now(), |_, _| Ok(true)).unwrap_err();
+        let past = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+        let err = read_jsonl_bounded(&path, past, |_, _| Ok(true)).unwrap_err();
         assert!(matches!(err, crate::error::Error::Timeout(_)));
         let _: Vec<Warning> = Vec::new();
     }
