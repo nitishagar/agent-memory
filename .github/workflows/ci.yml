@@ -27,3 +27,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace
+      - run: cargo build -p amem-cli
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh fish
+      - if: runner.os != 'Windows'
+        run: ./tests/e2e_phase1.sh ./target/debug/amem
