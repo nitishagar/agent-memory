@@ -80,6 +80,14 @@ pub struct IngestStats {
     pub malformed: u64,
     /// Oversize spool files skipped for the pass (left in place).
     pub skipped_large: u64,
+    /// Transcript files parsed this pass (all sources).
+    pub transcript_files: u64,
+    /// Transcript events parsed this pass (all sources).
+    pub transcript_events: u64,
+    /// New transcript records committed this pass.
+    pub transcript_ingested: u64,
+    /// Transcript warnings this pass (bad rows/files skipped).
+    pub transcript_warnings: u64,
 }
 
 /// Test-only crash hook: abort after committing `n` records (unclean death).

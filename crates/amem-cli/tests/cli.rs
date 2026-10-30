@@ -82,7 +82,13 @@ fn history_spool_to_ingest_roundtrip() {
         .unwrap();
     assert!(st.success());
     let out = amem()
-        .args(["--store-dir", &store, "ingest", "--once"])
+        .args([
+            "--store-dir",
+            &store,
+            "ingest",
+            "--once",
+            "--no-transcripts",
+        ])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -183,7 +189,13 @@ fn read_only_store_fails_clearly() {
     std::fs::create_dir(&store).unwrap();
     std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o555)).unwrap();
     let out = amem()
-        .args(["--store-dir", store.to_str().unwrap(), "ingest", "--once"])
+        .args([
+            "--store-dir",
+            store.to_str().unwrap(),
+            "ingest",
+            "--once",
+            "--no-transcripts",
+        ])
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -219,18 +231,78 @@ fn crash_mid_pass_recovers_exactly_once() {
     assert!(!st.success(), "crash flag must abort");
     // Clean rerun replays everything exactly once.
     let out = amem()
-        .args(["--store-dir", &store_s, "ingest", "--once"])
+        .args([
+            "--store-dir",
+            &store_s,
+            "ingest",
+            "--once",
+            "--no-transcripts",
+        ])
         .output()
         .unwrap();
     assert!(out.status.success());
     assert_eq!(store_count(&store), 200);
     // And a third pass is a no-op.
     let out = amem()
-        .args(["--store-dir", &store_s, "ingest", "--once"])
+        .args([
+            "--store-dir",
+            &store_s,
+            "ingest",
+            "--once",
+            "--no-transcripts",
+        ])
         .output()
         .unwrap();
     let stats: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(stats["ingested"], 0);
+}
+
+#[test]
+fn search_finds_seeded_command() {
+    let (_tmp, store) = temp_store("s12");
+    let store_s = store.to_str().unwrap().to_string();
+    let st = amem()
+        .env("AMEM_E1", "deploy needle-xyz-1")
+        .args([
+            "--store-dir",
+            &store_s,
+            "history",
+            "both",
+            "--shell",
+            "bash",
+            "--exit",
+            "0",
+            "--cmd-from-env",
+            "AMEM_E1",
+        ])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let st = amem()
+        .args([
+            "--store-dir",
+            &store_s,
+            "ingest",
+            "--once",
+            "--no-transcripts",
+        ])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let out = amem()
+        .args(["--store-dir", &store_s, "search", "needle-xyz-1"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("needle-xyz-1"), "stdout: {text}");
+    assert!(text.contains("[shell #0]"), "stdout: {text}");
+    let out = amem()
+        .args(["--store-dir", &store_s, "search", "nothing-matches-this"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().is_empty());
 }
 
 fn start_via_stdin(store: &str, shell: &str, cmd_bytes: &[u8]) -> String {
@@ -317,7 +389,13 @@ fn bad_redact_pattern_warns_instead_of_wedging() {
     std::fs::create_dir_all(&store).unwrap();
     std::fs::write(store.join("redact.json"), "{\"extra\": [\"([\"]}").unwrap();
     let out = amem()
-        .args(["--store-dir", store.to_str().unwrap(), "ingest", "--once"])
+        .args([
+            "--store-dir",
+            store.to_str().unwrap(),
+            "ingest",
+            "--once",
+            "--no-transcripts",
+        ])
         .output()
         .unwrap();
     let err = String::from_utf8(out.stderr).unwrap();
@@ -352,7 +430,13 @@ fn history_start_stdin_beats_argv_ceiling() {
         .unwrap();
     assert!(st.success());
     let out = amem()
-        .args(["--store-dir", &store_s, "ingest", "--once"])
+        .args([
+            "--store-dir",
+            &store_s,
+            "ingest",
+            "--once",
+            "--no-transcripts",
+        ])
         .output()
         .unwrap();
     let stats: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -386,7 +470,13 @@ fn history_start_stdin_strips_one_trailing_newline() {
         .unwrap();
     assert!(st.success());
     let out = amem()
-        .args(["--store-dir", &store_s, "ingest", "--once"])
+        .args([
+            "--store-dir",
+            &store_s,
+            "ingest",
+            "--once",
+            "--no-transcripts",
+        ])
         .output()
         .unwrap();
     assert!(out.status.success());

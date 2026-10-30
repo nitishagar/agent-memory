@@ -425,6 +425,46 @@ impl Store {
             |r| r.get(0),
         )?)
     }
+
+    /// Substring search over payloads newest-first. `stream_like` is a
+    /// `LIKE` pattern (`%` = all streams); `text` is matched literally
+    /// (`LIKE` metacharacters escaped). The MCP server builds on this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Db`] on `SQLite` failure.
+    pub fn search_stream(
+        &self,
+        device: &str,
+        stream_like: &str,
+        text: &str,
+        limit: i64,
+    ) -> Result<Vec<Record>> {
+        let escaped = text
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let mut stmt = self.conn.prepare(
+            "SELECT device, stream, idx, ts_ns, actor, kind, payload, hash
+             FROM records WHERE device = ?1 AND stream LIKE ?2
+             AND payload LIKE ?3 ESCAPE '\\' ORDER BY ts_ns DESC LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![device, stream_like, pattern, limit], |r| {
+            Ok(Record {
+                device: r.get(0)?,
+                stream: r.get(1)?,
+                idx: r.get(2)?,
+                ts_ns: r.get(3)?,
+                actor: r.get(4)?,
+                kind: r.get(5)?,
+                payload: r.get(6)?,
+                hash: r.get(7)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::Db)
+    }
 }
 
 /// blake3 hex of a canonical payload string (dedup hint + integrity).

@@ -1,0 +1,10 @@
+CREATE TABLE session(id TEXT PRIMARY KEY, project_id TEXT, directory TEXT, title TEXT, agent TEXT, time_created INTEGER, time_updated INTEGER);
+CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
+CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
+INSERT INTO session VALUES('ses_00000000000000000000000001','abc123','/home/u/proj','Test','build',1793318400000,1793318402000);
+INSERT INTO message VALUES('msg_user1','ses_00000000000000000000000001',1793318400000,1793318400000,'{"role":"user","time":{"created":1793318400000},"agent":"build","model":{"providerID":"p","modelID":"m"}}');
+INSERT INTO message VALUES('msg_asst1','ses_00000000000000000000000001',1793318401000,1793318402000,'{"parentID":"msg_user1","role":"assistant","mode":"build","agent":"build","modelID":"m","providerID":"p","time":{"created":1793318401000,"completed":1793318402000},"finish":"stop"}');
+INSERT INTO part VALUES('prt_text1','msg_user1','ses_00000000000000000000000001',1793318400000,1793318400000,'{"type":"text","text":"hi"}');
+INSERT INTO part VALUES('prt_text2','msg_asst1','ses_00000000000000000000000001',1793318401000,1793318401000,'{"type":"text","text":"hello"}');
+INSERT INTO part VALUES('prt_tool1','msg_asst1','ses_00000000000000000000000001',1793318401500,1793318401500,'{"type":"tool","tool":"read","callID":"call_1","state":{"status":"completed","input":{"path":"f"},"output":"contents"}}');
+INSERT INTO part VALUES('prt_step1','msg_asst1','ses_00000000000000000000000001',1793318402000,1793318402000,'{"type":"step-finish","reason":"stop"}');

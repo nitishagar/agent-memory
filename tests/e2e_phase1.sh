@@ -65,7 +65,7 @@ run_bash_case() {
   (cat "$home/cmds.txt"; while [ ! -f "$home/done" ]; do sleep 0.2; done; sleep 1) \
     | PATH="$(dirname "$AMEM_BIN"):$PATH" AMEM_STORE_DIR="$store" HOME="$home" \
     pty_run bash --noprofile --rcfile "$rc" -i >/dev/null 2>&1
-  AMEM_STORE_DIR="$store" "$AMEM_BIN" ingest --once >/dev/null
+  AMEM_STORE_DIR="$store" "$AMEM_BIN" ingest --once --no-transcripts >/dev/null
   local count
   count=$(AMEM_STORE_DIR="$store" "$AMEM_BIN" doctor | sed -n 's/.*records(shell): \([0-9]*\).*/\1/p')
   # 20 + 1MB line + the sentinel `touch` itself (honestly captured).
@@ -75,7 +75,7 @@ run_bash_case() {
 echo two' AMEM_STORE_DIR="$store" "$AMEM_BIN" history both --shell bash --exit 0 --cmd-from-env AMEM_E1 >/dev/null
   AMEM_E1='printf "x\ny\n"' AMEM_STORE_DIR="$store" "$AMEM_BIN" history both --shell bash --exit 0 --cmd-from-env AMEM_E1 >/dev/null
   AMEM_E1="$(printf 'a\x01b')" AMEM_STORE_DIR="$store" "$AMEM_BIN" history both --shell bash --exit 0 --cmd-from-env AMEM_E1 >/dev/null
-  AMEM_STORE_DIR="$store" "$AMEM_BIN" ingest --once > "$home/stats.json"
+  AMEM_STORE_DIR="$store" "$AMEM_BIN" ingest --once --no-transcripts > "$home/stats.json"
   count=$(AMEM_STORE_DIR="$store" "$AMEM_BIN" doctor | sed -n 's/.*records(shell): \([0-9]*\).*/\1/p')
   # 22 pty + 2 multiline + control-char = 25; empties/NUL covered in unit tests.
   if [ "$count" = "25" ]; then pass "bash edge top-up total 25"; else fail "bash edge total got [$count] want 25"; fi

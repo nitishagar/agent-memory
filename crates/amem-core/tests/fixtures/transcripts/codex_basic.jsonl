@@ -1,0 +1,7 @@
+{"timestamp":"2026-07-08T01:40:30.000Z","ordinal":0,"type":"session_meta","payload":{"id":"019f97ce-aaaa-7aaa-aaaa-aaaaaaaaaaaa","cwd":"/home/u/demo","cli_version":"0.153.4","source":"cli","model_provider":"openai"}}
+{"timestamp":"2026-07-08T01:40:31.000Z","ordinal":1,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}
+{"timestamp":"2026-07-08T01:40:32.000Z","ordinal":2,"type":"response_item","payload":{"type":"function_call","call_id":"call_9","name":"Bash","arguments":"{\"command\":\"ls\"}"}}
+{"timestamp":"2026-07-08T01:40:33.000Z","ordinal":3,"type":"response_item","payload":{"type":"function_call_output","call_id":"call_9","output":"a.txt"}}
+{"timestamp":"2026-07-08T01:40:34.000Z","ordinal":4,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Listed."}]}}
+{"timestamp":"2026-07-08T01:40:35.000Z","ordinal":5,"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110},"model_context_window":272000}}}
+{"timestamp":"2026-07-08T01:40:36.000Z","ordinal":6,"type":"compacted","payload":{"replacement_history":[]}}

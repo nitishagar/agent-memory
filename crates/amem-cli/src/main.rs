@@ -40,6 +40,24 @@ enum Commands {
         /// TEST ONLY: abort after N commits (unclean death for recovery tests).
         #[arg(long, hide = true)]
         crash_after: Option<u64>,
+        /// Override one transcript source root (`NAME=PATH`, repeatable).
+        /// Names: claude, codex, cursor, opencode, pi, zcode.
+        #[arg(long)]
+        transcript_root: Vec<String>,
+        /// Skip the transcript pass (spool only).
+        #[arg(long)]
+        no_transcripts: bool,
+    },
+    /// Substring-search stored records, newest first.
+    Search {
+        /// Text to find in record payloads (literal; ASCII case-insensitive).
+        query: String,
+        /// Stream filter (`shell`, `transcript:claude`, ...; `%` = all).
+        #[arg(long, default_value = "%")]
+        stream: String,
+        /// Maximum records to print.
+        #[arg(long, default_value = "20")]
+        limit: i64,
     },
     /// Report store/hook/transcript health. Read-only, always exit 0.
     Doctor,
@@ -170,6 +188,183 @@ fn redactor(store: &std::path::Path) -> Result<amem_core::redact::Redactor> {
     Ok(r)
 }
 
+/// One transcript pass over all six sources. `overrides` are
+/// `NAME=PATH` roots (tests/fake dirs); otherwise each source's default
+/// root applies. Warnings go to stderr; a blown time budget on one source
+/// warns and moves on so the other five still run.
+fn run_transcripts(
+    db: &mut amem_core::store::Store,
+    device: &str,
+    redactor: &amem_core::redact::Redactor,
+    actor: &str,
+    overrides: &[String],
+    stats: &mut amem_core::ingest::IngestStats,
+) -> Result<()> {
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    let mut over: HashMap<&str, &str> = HashMap::new();
+    for o in overrides {
+        match o.split_once('=') {
+            Some((name, path)) if !name.is_empty() && !path.is_empty() => {
+                over.insert(name, path);
+            }
+            _ => {
+                return Err(Error::InvalidArguments(format!(
+                    "bad --transcript-root {o:?}: expected NAME=PATH"
+                )));
+            }
+        }
+    }
+    for source in amem_core::transcripts::Source::all() {
+        let root = over
+            .get(source.name())
+            .map(std::path::PathBuf::from)
+            .or_else(|| amem_core::transcripts::default_root(*source));
+        let Some(root) = root else { continue };
+        if !over.contains_key(source.name()) && !root.exists() {
+            continue; // Source not installed: silent skip.
+        }
+        let deadline = Instant::now() + amem_core::transcripts::PASS_DEADLINE;
+        match amem_core::transcripts::ingest::ingest_source(
+            db, device, actor, redactor, *source, &root, deadline,
+        ) {
+            Ok((ts, warnings)) => {
+                stats.transcript_files += ts.files;
+                stats.transcript_events += ts.events;
+                stats.transcript_ingested += ts.ingested;
+                stats.transcript_warnings += warnings.len() as u64;
+                for w in warnings {
+                    eprintln!("amem: transcript warn: {}: {}", w.path.display(), w.reason);
+                }
+            }
+            Err(Error::Timeout(e)) => {
+                eprintln!("amem: transcript warn: {e}");
+                stats.transcript_warnings += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// One human-readable search hit line. Shapes differ per stream, so the
+/// payload is sniffed: shell records show `cmd`, transcripts show
+/// `source/session/role` plus the first text line.
+fn render_hit(rec: &amem_core::store::Record) -> String {
+    let payload: serde_json::Value =
+        serde_json::from_str(&rec.payload).unwrap_or(serde_json::Value::Null);
+    let first_line = |s: &str| {
+        let line = s.lines().next().unwrap_or_default();
+        if line.chars().count() > 160 {
+            format!("{}…", line.chars().take(160).collect::<String>())
+        } else {
+            line.to_string()
+        }
+    };
+    if rec.stream == "shell" {
+        let cmd = payload
+            .get("cmd")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let exit = payload.get("exit").and_then(serde_json::Value::as_i64);
+        return format!(
+            "[shell #{}] {} (exit {})",
+            rec.idx,
+            first_line(cmd),
+            exit.map_or_else(|| "?".to_string(), |e| e.to_string())
+        );
+    }
+    let source = payload
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let session = payload
+        .get("session")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let role = payload
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let text = payload
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let short = if session.len() > 8 {
+        &session[..8]
+    } else {
+        session
+    };
+    format!(
+        "[{} #{}] {short} {role}: {}",
+        source,
+        rec.idx,
+        first_line(text)
+    )
+}
+
+/// `ingest --once`: spool pass, then the six-source transcript pass.
+#[allow(clippy::too_many_arguments)]
+fn cmd_ingest(
+    store: &std::path::Path,
+    once: bool,
+    crash_after: Option<u64>,
+    transcript_root: &[String],
+    no_transcripts: bool,
+) -> Result<()> {
+    if !once {
+        return Err(Error::InvalidArguments(
+            "ingest needs --once (daemon mode is not in Phase 1)".to_string(),
+        ));
+    }
+    paths::ensure_writable(store)?;
+    let mut db = amem_core::store::Store::open(store)?;
+    let device = amem_core::store::device_id(store)?;
+    let redactor = redactor(store)?;
+    let mut stats = amem_core::ingest::ingest_once(
+        &mut db,
+        &paths::spool_dir(store),
+        &device,
+        &actor(),
+        &redactor,
+        amem_core::ingest::IngestOptions {
+            crash_after: crash_after.unwrap_or(0),
+        },
+    )?;
+    if !no_transcripts {
+        run_transcripts(
+            &mut db,
+            &device,
+            &redactor,
+            &actor(),
+            transcript_root,
+            &mut stats,
+        )?;
+    }
+    println!("{}", serde_json::to_string(&stats).unwrap_or_default());
+    Ok(())
+}
+
+/// `search`: read-only substring search, newest first.
+fn cmd_search(store: &std::path::Path, query: &str, stream: &str, limit: i64) -> Result<()> {
+    let limit = limit.clamp(1, 200);
+    let db = amem_core::store::Store::open_readonly(store)
+        .map_err(|_| Error::NotFound("store not initialized; nothing to search".to_string()))?;
+    let device = std::fs::read_to_string(store.join("device_id"))
+        .map(|d| d.trim().to_string())
+        .unwrap_or_default();
+    if device.is_empty() {
+        return Err(Error::NotFound(
+            "store not initialized; nothing to search".to_string(),
+        ));
+    }
+    for rec in db.search_stream(&device, stream, query, limit)? {
+        println!("{}", render_hit(&rec));
+    }
+    Ok(())
+}
+
 fn run() -> Result<()> {
     // `serde` derive lives in amem-core; the CLI needs it for RedactConfig.
     let cli = Cli::parse();
@@ -219,29 +414,17 @@ fn run() -> Result<()> {
                 ),
             }
         }
-        Some(Commands::Ingest { once, crash_after }) => {
-            if !once {
-                return Err(Error::InvalidArguments(
-                    "ingest needs --once (daemon mode is not in Phase 1)".to_string(),
-                ));
-            }
-            paths::ensure_writable(&store)?;
-            let mut db = amem_core::store::Store::open(&store)?;
-            let device = amem_core::store::device_id(&store)?;
-            let redactor = redactor(&store)?;
-            let stats = amem_core::ingest::ingest_once(
-                &mut db,
-                &paths::spool_dir(&store),
-                &device,
-                &actor(),
-                &redactor,
-                amem_core::ingest::IngestOptions {
-                    crash_after: crash_after.unwrap_or(0),
-                },
-            )?;
-            println!("{}", serde_json::to_string(&stats).unwrap_or_default());
-            Ok(())
-        }
+        Some(Commands::Ingest {
+            once,
+            crash_after,
+            transcript_root,
+            no_transcripts,
+        }) => cmd_ingest(&store, once, crash_after, &transcript_root, no_transcripts),
+        Some(Commands::Search {
+            query,
+            stream,
+            limit,
+        }) => cmd_search(&store, &query, &stream, limit),
         Some(Commands::Doctor) => {
             let spool_n =
                 amem_core::spool::pending_spools(&paths::spool_dir(&store)).map_or(0, |v| v.len());
