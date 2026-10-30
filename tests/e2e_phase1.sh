@@ -26,7 +26,9 @@ pty_run() {
   if [ "$(uname -s)" = "Darwin" ]; then
     TERM=dumb VTE_VERSION= script -q /dev/null "$@"
   else
-    TERM=dumb VTE_VERSION= script -qec "$*" /dev/null
+    local cmd
+    printf -v cmd '%q ' "$@"
+    TERM=dumb VTE_VERSION= script -qec "$cmd" /dev/null
   fi
 }
 
@@ -79,6 +81,28 @@ echo two' AMEM_STORE_DIR="$store" "$AMEM_BIN" history both --shell bash --exit 0
   if [ "$count" = "25" ]; then pass "bash edge top-up total 25"; else fail "bash edge total got [$count] want 25"; fi
   if grep -q "supersecret1" "$home/stats.json"; then fail "bash secret in stats"; else pass "bash no leak"; fi
   if AMEM_STORE_DIR="$store" "$AMEM_BIN" doctor | grep -q "supersecret1"; then fail "bash secret in doctor"; else pass "bash store clean"; fi
+  # Load-bearing: the secret must not be in queryable storage (DB payloads
+  # or leftover spool), and the redaction marker must be.
+  python3 - "$store/memory.db" "$store/spool" > "$home/dbcheck.txt" <<'PYEOF'
+import sqlite3, sys, pathlib
+db, spooldir = sys.argv[1], sys.argv[2]
+blobs = []
+con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+blobs += [r[0] for r in con.execute("select payload from records")]
+con.close()
+sp = pathlib.Path(spooldir)
+if sp.is_dir():
+    for f in sp.iterdir():
+        if f.is_file() and not f.is_symlink():
+            blobs.append(f.read_bytes().decode("utf-8", "replace"))
+text = "\n".join(blobs)
+print("secret_present=", "supersecret1" in text)
+print("marker_present=", "[redacted:secret-assign]" in text)
+print("completed_present=", '"completed":true' in text)
+PYEOF
+  if grep -q "secret_present= True" "$home/dbcheck.txt"; then fail "bash secret in DB/spool"; else pass "bash DB clean"; fi
+  if grep -q "marker_present= True" "$home/dbcheck.txt"; then pass "bash marker stored"; else fail "bash marker missing"; fi
+  if grep -q "completed_present= True" "$home/dbcheck.txt"; then pass "bash payload shape"; else fail "bash payload shape"; fi
   rm -rf "$home"
 }
 

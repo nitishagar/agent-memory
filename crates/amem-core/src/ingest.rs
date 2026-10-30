@@ -28,9 +28,19 @@ pub const PENDING_MAX_AGE_SECS: u64 = 24 * 3600;
 /// Same bound in nanoseconds (i64: matches record timestamps).
 const PENDING_MAX_AGE_NS: i64 = 86_400_000_000_000;
 
+/// Spool files larger than this are skipped for the pass (left in
+/// place, counted): legit files hold one ≤1MB line, so anything past
+/// 16MB is hostile or corrupt, never memory.
+pub const MAX_SPOOL_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Cap on distinct git probes per pass: `cwd` is spool-controlled.
+const MAX_GIT_PROBES_PER_PASS: usize = 1000;
+
 /// Raw hook line (v1 protocol).
 #[derive(Debug, Deserialize)]
 struct SpoolLine {
+    #[serde(default)]
+    v: u32,
     op: String,
     id: String,
     #[serde(default)]
@@ -68,6 +78,8 @@ pub struct IngestStats {
     pub incomplete: u64,
     /// Malformed spool lines skipped.
     pub malformed: u64,
+    /// Oversize spool files skipped for the pass (left in place).
+    pub skipped_large: u64,
 }
 
 /// Test-only crash hook: abort after committing `n` records (unclean death).
@@ -100,14 +112,27 @@ pub fn ingest_once(
     // committed. A crash anywhere replays from intact spool files, and
     // `insert_mapped` makes redelivery idempotent.
     let spool_files = spool::pending_spools(spool_dir)?;
+    let mut shreddable: Vec<&Path> = Vec::with_capacity(spool_files.len());
     for path in &spool_files {
-        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let size = std::fs::metadata(path).map_or(0, |m| m.len());
+        if size > MAX_SPOOL_FILE_BYTES {
+            stats.skipped_large += 1;
+            continue;
+        }
+        // Unreadable is not malformed: leave the file for a later pass
+        // (transient errors resolve; shredding would destroy evidence).
+        // Counted so the pass stays loud.
+        let Ok(text) = std::fs::read_to_string(path) else {
+            stats.malformed += 1;
+            continue;
+        };
+        shreddable.push(path);
         for line in text.lines() {
             match serde_json::from_str::<SpoolLine>(line) {
-                Ok(s) if s.op == "start" => {
+                Ok(s) if s.v == spool::SPOOL_VERSION && s.op == "start" => {
                     starts_by_id.insert(s.id.clone(), s);
                 }
-                Ok(s) if s.op == "end" => {
+                Ok(s) if s.v == spool::SPOOL_VERSION && s.op == "end" => {
                     ends_by_id.insert(s.id.clone(), s);
                 }
                 _ => stats.malformed += 1,
@@ -125,10 +150,14 @@ pub fn ingest_once(
         redactor,
         git_cache: &mut git_cache,
     };
-    for (id, start) in starts_by_id {
+    // Commit in capture order so `(device, stream, idx)` is causal.
+    let mut ordered: Vec<(String, SpoolLine)> = starts_by_id.into_iter().collect();
+    ordered.sort_by(|a, b| (a.1.ts_ns, &a.0).cmp(&(b.1.ts_ns, &b.0)));
+    for (id, start) in ordered {
         let end = ends_by_id.remove(&id);
         if end.is_none() {
-            let age = now_ns.saturating_sub(start.ts_ns);
+            // Clamp future timestamps for aging: far-future pins nothing.
+            let age = now_ns.saturating_sub(start.ts_ns.min(now_ns));
             if age < PENDING_MAX_AGE_NS {
                 stats.pending_kept += 1;
                 kept.push(start);
@@ -143,7 +172,25 @@ pub fn ingest_once(
             }
         }
     }
-    stats.orphan_end = ends_by_id.len() as u64;
+
+    // Young orphan ends are rewritten like pending starts: their start may
+    // still be a staging dotfile (skipped by the listing) and arrive next
+    // pass. Old orphans are counted and dropped.
+    let mut orphans: Vec<SpoolLine> = ends_by_id.into_values().collect();
+    orphans.sort_by(|a, b| a.id.cmp(&b.id));
+    for end in orphans {
+        let age = now_ns.saturating_sub(end.ts_ns.min(now_ns));
+        if age < PENDING_MAX_AGE_NS {
+            let line = serde_json::json!({
+                "v": 1, "op": "end", "id": end.id, "exit": end.exit,
+                "dur_ns": end.dur_ns, "ts_ns": end.ts_ns,
+            });
+            spool::spool_line(spool_dir, &line.to_string())?;
+            stats.pending_kept += 1;
+        } else {
+            stats.orphan_end += 1;
+        }
+    }
 
     // Rewrite young pending starts for a later pass (atomic via spool),
     // then shred the originals. Any crash order replays safely: pending ids
@@ -155,7 +202,7 @@ pub fn ingest_once(
         });
         spool::spool_line(spool_dir, &line.to_string())?;
     }
-    for path in &spool_files {
+    for path in shreddable {
         spool::shred(path)?;
     }
     Ok(stats)
@@ -192,22 +239,28 @@ fn commit_start(
         stats.truncated += 1;
     }
     let (cmd, redacted) = ctx.redactor.redact(&cmd);
+    let (cwd, cwd_redacted) = ctx.redactor.redact(&start.cwd);
     let multiline = cmd.contains('\n');
-    let git_info = ctx
-        .git_cache
-        .entry(start.cwd.clone())
-        .or_insert_with(|| git::probe(Path::new(&start.cwd)).unwrap_or(None))
-        .clone();
+    // `cwd` is spool-controlled: never probe missing dirs, cap probes.
+    let git_info =
+        if Path::new(&start.cwd).exists() && ctx.git_cache.len() < MAX_GIT_PROBES_PER_PASS {
+            ctx.git_cache
+                .entry(start.cwd.clone())
+                .or_insert_with(|| git::probe(Path::new(&start.cwd)).unwrap_or(None))
+                .clone()
+        } else {
+            ctx.git_cache.get(&start.cwd).cloned().flatten()
+        };
     let payload = serde_json::json!({
         "cmd": cmd,
         "cmd_len": full_len,
         "truncated": truncated,
         "multiline": multiline,
-        "redacted": redacted,
+        "redacted": redacted || cwd_redacted,
         "exit": end.and_then(|e| e.exit),
         "dur_ns": end.and_then(|e| e.dur_ns),
         "completed": end.is_some(),
-        "cwd": start.cwd,
+        "cwd": cwd,
         "session": start.session,
         "shell": start.shell,
         "git": git_info.map(|g| serde_json::json!({
@@ -271,8 +324,19 @@ mod tests {
         .to_string()
     }
 
+    fn start_ts(id: &str, cmd: &str, ts_ns: i64) -> String {
+        serde_json::json!({"v":1,"op":"start","id":id,"shell":"bash","cmd":cmd,
+            "cwd":"/tmp","ts_ns":ts_ns,"session":"s1"})
+        .to_string()
+    }
+
     fn end(id: &str, exit: i64) -> String {
         serde_json::json!({"v":1,"op":"end","id":id,"exit":exit,"dur_ns":1000}).to_string()
+    }
+
+    fn end_ts(id: &str, exit: i64, ts_ns: i64) -> String {
+        serde_json::json!({"v":1,"op":"end","id":id,"exit":exit,"dur_ns":1000,"ts_ns":ts_ns})
+            .to_string()
     }
 
     #[test]
@@ -381,6 +445,182 @@ mod tests {
         .unwrap();
         assert_eq!(st.ingested, 0);
         assert_eq!(store.count_stream(&device, "shell").unwrap(), 1);
+    }
+
+    #[test]
+    fn aged_start_records_incomplete() {
+        let (tmp, mut store, device, redactor) = harness();
+        let spool = tmp.path().join("spool");
+        let old = now_nanos() - PENDING_MAX_AGE_NS - 1;
+        spool::spool_line(&spool, &start_ts("old1", "sleep 999", old)).unwrap();
+        let stats = ingest_once(
+            &mut store,
+            &spool,
+            &device,
+            "t:u",
+            &redactor,
+            IngestOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(stats.incomplete, 1);
+        assert_eq!(stats.pending_kept, 0);
+        assert!(spool::pending_spools(&spool).unwrap().is_empty());
+        let rec = store.get_record(&device, "shell", 0).unwrap();
+        assert!(rec.payload.contains("\"completed\":false"));
+    }
+
+    #[test]
+    fn young_orphan_end_rewritten_old_dropped() {
+        let (tmp, mut store, device, redactor) = harness();
+        let spool = tmp.path().join("spool");
+        spool::spool_line(&spool, &end_ts("late-start", 0, now_nanos())).unwrap();
+        spool::spool_line(&spool, &end_ts("ancient", 0, 1)).unwrap();
+        let stats = ingest_once(
+            &mut store,
+            &spool,
+            &device,
+            "t:u",
+            &redactor,
+            IngestOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(stats.pending_kept, 1);
+        assert_eq!(stats.orphan_end, 1);
+        assert_eq!(store.count_stream(&device, "shell").unwrap(), 0);
+        // The young orphan survives; the late start pairs next pass.
+        assert_eq!(spool::pending_spools(&spool).unwrap().len(), 1);
+        spool::spool_line(&spool, &start("late-start", "echo late")).unwrap();
+        let stats = ingest_once(
+            &mut store,
+            &spool,
+            &device,
+            "t:u",
+            &redactor,
+            IngestOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(stats.ingested, 1);
+    }
+
+    #[test]
+    fn oversize_spool_left_in_place() {
+        let (tmp, mut store, device, redactor) = harness();
+        let spool = tmp.path().join("spool");
+        std::fs::create_dir_all(&spool).unwrap();
+        let big = "z".repeat(usize::try_from(MAX_SPOOL_FILE_BYTES + 1).unwrap());
+        std::fs::write(spool.join("spool-huge.jsonl"), big).unwrap();
+        let stats = ingest_once(
+            &mut store,
+            &spool,
+            &device,
+            "t:u",
+            &redactor,
+            IngestOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(stats.skipped_large, 1);
+        assert_eq!(stats.malformed, 0);
+        assert!(spool.join("spool-huge.jsonl").exists());
+    }
+
+    #[test]
+    fn future_protocol_version_is_malformed() {
+        let (tmp, mut store, device, redactor) = harness();
+        let spool = tmp.path().join("spool");
+        spool::spool_line(
+            &spool,
+            r#"{"v":2,"op":"start","id":"v2","shell":"bash","cmd":"ls","cwd":"/tmp","ts_ns":1,"session":"s"}"#,
+        )
+        .unwrap();
+        let stats = ingest_once(
+            &mut store,
+            &spool,
+            &device,
+            "t:u",
+            &redactor,
+            IngestOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(stats.malformed, 1);
+        assert_eq!(store.count_stream(&device, "shell").unwrap(), 0);
+    }
+
+    #[test]
+    fn commit_order_follows_capture_time() {
+        let (tmp, mut store, device, redactor) = harness();
+        let spool = tmp.path().join("spool");
+        let base = 1_700_000_000_000_000_000i64;
+        // Spool newest-first; idx must still follow ts.
+        for (id, ts, cmd) in [
+            ("c", base + 2, "third"),
+            ("a", base, "first"),
+            ("b", base + 1, "second"),
+        ] {
+            spool::spool_line(&spool, &start_ts(id, cmd, ts)).unwrap();
+            spool::spool_line(&spool, &end(id, 0)).unwrap();
+        }
+        ingest_once(
+            &mut store,
+            &spool,
+            &device,
+            "t:u",
+            &redactor,
+            IngestOptions::default(),
+        )
+        .unwrap();
+        for (idx, cmd) in [(0, "first"), (1, "second"), (2, "third")] {
+            let rec = store.get_record(&device, "shell", idx).unwrap();
+            assert!(rec.payload.contains(cmd), "idx {idx}: {}", rec.payload);
+        }
+    }
+
+    #[test]
+    fn secrets_in_cwd_redacted() {
+        let (tmp, mut store, device, redactor) = harness();
+        let spool = tmp.path().join("spool");
+        let line = serde_json::json!({"v":1,"op":"start","id":"cwd1","shell":"bash",
+            "cmd":"ls","cwd":"/tmp/token=s3cr3t","ts_ns":now_nanos(),"session":"s1"})
+        .to_string();
+        spool::spool_line(&spool, &line).unwrap();
+        spool::spool_line(&spool, &end("cwd1", 0)).unwrap();
+        ingest_once(
+            &mut store,
+            &spool,
+            &device,
+            "t:u",
+            &redactor,
+            IngestOptions::default(),
+        )
+        .unwrap();
+        let rec = store.get_record(&device, "shell", 0).unwrap();
+        assert!(!rec.payload.contains("s3cr3t"), "{}", rec.payload);
+        assert!(rec.payload.contains("[redacted:secret-assign]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_spool_kept_not_shredded() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, mut store, device, redactor) = harness();
+        let spool = tmp.path().join("spool");
+        let p = spool::spool_line(&spool, &start("u1", "echo hi")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_to_string(&p).is_ok() {
+            return; // Running as root: perms don't bite; nothing to prove.
+        }
+        let stats = ingest_once(
+            &mut store,
+            &spool,
+            &device,
+            "t:u",
+            &redactor,
+            IngestOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(stats.malformed, 1);
+        assert_eq!(stats.ingested, 0);
+        assert!(p.exists(), "unreadable spool must survive the pass");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     #[test]

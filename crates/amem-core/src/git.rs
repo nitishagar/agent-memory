@@ -6,13 +6,21 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
 
 /// Hard timeout for the whole probe sequence.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Kill flag shared with the probe thread: on timeout the waiter sets it
+/// and the in-flight `git` is killed instead of orphaned.
+#[derive(Debug, Default)]
+struct Killer {
+    die: AtomicBool,
+}
 
 /// Repository identity for one captured event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,49 +49,84 @@ pub struct GitInfo {
 /// [`Error::Io`] if git cannot be spawned.
 pub fn probe(cwd: &Path) -> Result<Option<GitInfo>> {
     let cwd = cwd.to_path_buf();
+    let killer = Arc::new(Killer::default());
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(probe_inner(&cwd));
-    });
-    rx.recv_timeout(PROBE_TIMEOUT)
-        .map_err(|_| Error::Timeout(format!("git probe exceeded {}s", PROBE_TIMEOUT.as_secs())))
+    std::thread::scope(|s| {
+        let killer2 = Arc::clone(&killer);
+        s.spawn(move || {
+            let _ = tx.send(probe_inner(&cwd, &killer2));
+        });
+        if let Ok(info) = rx.recv_timeout(PROBE_TIMEOUT) {
+            Ok(info)
+        } else {
+            killer.die.store(true, Ordering::SeqCst);
+            Err(Error::Timeout(format!(
+                "git probe exceeded {}s",
+                PROBE_TIMEOUT.as_secs()
+            )))
+        }
+    })
 }
 
-fn git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
+fn git(cwd: &Path, args: &[&str], killer: &Killer) -> Option<String> {
+    let mut child = Command::new("git")
         .arg("-C")
         .arg(cwd)
         .args(args)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
-    if !out.status.success() {
-        return None;
+    loop {
+        if killer.die.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                if let Some(mut pipe) = child.stdout.take() {
+                    use std::io::Read as _;
+                    let _ = pipe.read_to_end(&mut stdout);
+                }
+                if !status.success() {
+                    return None;
+                }
+                return Some(String::from_utf8_lossy(&stdout).trim().to_string());
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Err(_) => return None,
+        }
     }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn probe_inner(cwd: &Path) -> Option<GitInfo> {
+fn probe_inner(cwd: &Path, killer: &Killer) -> Option<GitInfo> {
     // Bare repo check first: cwd itself may be the repo (no work tree).
-    if git(cwd, &["rev-parse", "--is-bare-repository"]).as_deref() == Some("true") {
+    if git(cwd, &["rev-parse", "--is-bare-repository"], killer).as_deref() == Some("true") {
         let canonical = canonical(cwd);
-        let local_only = git(cwd, &["remote", "get-url", "origin"]).is_none();
+        let local_only = git(cwd, &["remote", "get-url", "origin"], killer).is_none();
         return Some(GitInfo {
             repo_id: canonical,
             branch: None,
-            commit: git(cwd, &["rev-parse", "HEAD"]),
+            commit: git(cwd, &["rev-parse", "HEAD"], killer),
             bare: true,
             submodule_outer: None,
             local_only,
         });
     }
-    let toplevel = git(cwd, &["rev-parse", "--show-toplevel"])?;
+    let toplevel = git(cwd, &["rev-parse", "--show-toplevel"], killer)?;
     let toplevel_path = PathBuf::from(&toplevel);
-    let branch =
-        git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).filter(|b| b != "HEAD" && !b.is_empty());
-    let commit = git(cwd, &["rev-parse", "HEAD"]);
-    let submodule_outer =
-        git(cwd, &["rev-parse", "--show-superproject-working-tree"]).filter(|s| !s.is_empty());
-    let local_only = git(cwd, &["remote", "get-url", "origin"]).is_none();
+    let branch = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"], killer)
+        .filter(|b| b != "HEAD" && !b.is_empty());
+    let commit = git(cwd, &["rev-parse", "HEAD"], killer);
+    let submodule_outer = git(
+        cwd,
+        &["rev-parse", "--show-superproject-working-tree"],
+        killer,
+    )
+    .filter(|s| !s.is_empty());
+    let local_only = git(cwd, &["remote", "get-url", "origin"], killer).is_none();
     let _ = &toplevel_path;
     Some(GitInfo {
         repo_id: toplevel,

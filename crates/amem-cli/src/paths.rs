@@ -29,7 +29,8 @@ pub fn spool_dir(store: &std::path::Path) -> PathBuf {
 
 /// Probe that `store` is writable: create dirs, round-trip a temp file.
 /// Used at startup so locked-down machines fail with a clear error naming
-/// the path instead of dying mid-ingest.
+/// the path instead of dying mid-ingest. Random suffix + `create_new` so a
+/// planted symlink at a fixed probe name cannot redirect the write.
 pub fn ensure_writable(store: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(store).map_err(|e| {
         Error::InvalidArguments(format!(
@@ -37,13 +38,30 @@ pub fn ensure_writable(store: &std::path::Path) -> Result<()> {
             store.display()
         ))
     })?;
-    let probe = store.join(".amem-writability-probe");
-    std::fs::write(&probe, b"ok").map_err(|e| {
-        Error::InvalidArguments(format!(
-            "store dir {} is not writable: {e}",
-            store.display()
-        ))
-    })?;
+    let probe = store.join(format!(
+        ".amem-writability-probe-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .map_err(|e| {
+                Error::InvalidArguments(format!(
+                    "store dir {} is not writable: {e}",
+                    store.display()
+                ))
+            })?;
+        f.write_all(b"ok").map_err(|e| {
+            Error::InvalidArguments(format!(
+                "store dir {} is not writable: {e}",
+                store.display()
+            ))
+        })?;
+    }
     std::fs::remove_file(&probe).map_err(Error::Io)?;
     Ok(())
 }

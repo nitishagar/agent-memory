@@ -6,6 +6,7 @@ if [ -z "${AMEM_SESSION:-}" ]; then
   export AMEM_SESSION
 fi
 __amem_preexec() {
+  unset AMEM_HISTORY_ID
   AMEM_HISTORY_ID=$(printf '%s' "$1" | amem history start --shell bash --cmd-from-stdin 2>/dev/null) || return 0
   export AMEM_HISTORY_ID
   AMEM_EPOCHREALTIME=${EPOCHREALTIME:-}

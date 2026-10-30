@@ -11,6 +11,7 @@ pub mod ingest;
 pub mod redact;
 pub mod spool;
 pub mod store;
+pub mod transcripts;
 
 /// Crate version, for store schema compatibility checks.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

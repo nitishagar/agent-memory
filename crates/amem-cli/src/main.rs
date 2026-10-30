@@ -134,17 +134,40 @@ struct RedactConfig {
     extra: Vec<String>,
 }
 
+/// Maximum `redact.json` size and custom-pattern count: the file is
+/// store-writable, so a hostile config must not wedge ingest.
+const MAX_REDACT_JSON_BYTES: u64 = 1024 * 1024;
+const MAX_REDACT_EXTRA: usize = 1024;
+
 fn redactor(store: &std::path::Path) -> Result<amem_core::redact::Redactor> {
     let path = store.join("redact.json");
-    let cfg: RedactConfig = match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text)
-            .map_err(|e| Error::InvalidArguments(format!("bad {}: {e}", path.display())))?,
+    let cfg: RedactConfig = match std::fs::metadata(&path) {
+        Ok(m) if m.len() > MAX_REDACT_JSON_BYTES => {
+            eprintln!("amem: warn: {} oversize, using defaults", path.display());
+            RedactConfig::default()
+        }
+        Ok(_) => match std::fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text)
+                .map_err(|e| Error::InvalidArguments(format!("bad {}: {e}", path.display())))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => RedactConfig::default(),
+            Err(e) => return Err(Error::Io(e)),
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => RedactConfig::default(),
         Err(e) => return Err(Error::Io(e)),
     };
-    amem_core::redact::Redactor::new()
-        .with_allow(cfg.allow)
-        .with_extra(&cfg.extra)
+    let mut r = amem_core::redact::Redactor::new().with_allow(cfg.allow);
+    for pat in cfg.extra.iter().take(MAX_REDACT_EXTRA) {
+        if let Err(e) = r.try_add_extra(pat) {
+            eprintln!("amem: warn: skipping redaction pattern: {e}");
+        }
+    }
+    if cfg.extra.len() > MAX_REDACT_EXTRA {
+        eprintln!(
+            "amem: warn: {} extra patterns over cap {MAX_REDACT_EXTRA}, rest ignored",
+            cfg.extra.len()
+        );
+    }
+    Ok(r)
 }
 
 fn run() -> Result<()> {
@@ -222,11 +245,17 @@ fn run() -> Result<()> {
         Some(Commands::Doctor) => {
             let spool_n =
                 amem_core::spool::pending_spools(&paths::spool_dir(&store)).map_or(0, |v| v.len());
-            let count = amem_core::store::Store::open(&store).ok().and_then(|db| {
-                amem_core::store::device_id(&store)
-                    .ok()
-                    .and_then(|d| db.count_stream(&d, "shell").ok())
-            });
+            // Strictly read-only: never create the store, the DB, or the
+            // device id. Absent pieces report as "not initialized".
+            let count = std::fs::read_to_string(store.join("device_id"))
+                .ok()
+                .map(|d| d.trim().to_string())
+                .filter(|d| !d.is_empty())
+                .and_then(|d| {
+                    amem_core::store::Store::open_readonly(&store)
+                        .ok()
+                        .and_then(|db| db.count_stream(&d, "shell").ok())
+                });
             print!("{}", doctor::report(&store, spool_n, count));
             Ok(())
         }
@@ -239,7 +268,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         None => {
-            println!("amem 0.1.0 — run `amem --help`");
+            println!("amem {} — run `amem --help`", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
     }

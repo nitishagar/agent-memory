@@ -28,6 +28,21 @@ fn read_cmd_stdin() -> Result<String> {
     Ok(cmd)
 }
 
+/// Shells the hooks emit. Anything else is a caller bug, rejected here
+/// rather than stored as a junk stream facet.
+const KNOWN_SHELLS: &[&str] = &["bash", "zsh", "fish", "powershell"];
+
+fn check_shell(shell: &str) -> Result<()> {
+    if KNOWN_SHELLS.contains(&shell) {
+        Ok(())
+    } else {
+        Err(Error::InvalidArguments(format!(
+            "unknown shell '{shell}': expected {}",
+            KNOWN_SHELLS.join(", ")
+        )))
+    }
+}
+
 /// Emit a `start` line; prints the pairing id to stdout.
 pub fn start(
     spool_dir: &std::path::Path,
@@ -38,6 +53,7 @@ pub fn start(
     cwd: Option<PathBuf>,
     session: Option<String>,
 ) -> Result<()> {
+    check_shell(shell)?;
     let cmd = if cmd_from_stdin {
         read_cmd_stdin()?
     } else {
@@ -90,6 +106,7 @@ pub fn both(
     cmd_from_env: &str,
     cmd_from_stdin: bool,
 ) -> Result<()> {
+    check_shell(shell)?;
     let cmd = if cmd_from_stdin {
         read_cmd_stdin()?
     } else {

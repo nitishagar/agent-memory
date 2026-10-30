@@ -14,8 +14,14 @@ function global:prompt {
     $h = Get-History -Count 1 -ErrorAction SilentlyContinue
     if ($null -ne $h -and $h.Id -ne $global:__amem_last_hid) {
       $global:__amem_last_hid = $h.Id
-      $code = if ($ec) { 0 } elseif ($null -ne $global:LASTEXITCODE) { $global:LASTEXITCODE } else { 1 }
-      $dur = [int64]($h.Duration.Ticks * 100)
+      # ExecutionStatus (not $LASTEXITCODE, which goes stale) decides failure.
+      if ($h.ExecutionStatus -eq 'Completed' -and $ec) { $code = 0 }
+      elseif ($null -ne $global:LASTEXITCODE) { $code = $global:LASTEXITCODE }
+      else { $code = 1 }
+      $dur = 0
+      if ($null -ne $h.EndExecutionTime -and $null -ne $h.StartExecutionTime) {
+        $dur = [int64](($h.EndExecutionTime - $h.StartExecutionTime).Ticks * 100)
+      }
       # Piped stdin: env/argv strings hit the OS MAX_ARG_STRLEN ceiling (~128KB).
       $h.CommandLine | & amem history both --shell powershell --exit $code --duration-ns $dur --cmd-from-stdin 2>$null
     }

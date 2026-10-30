@@ -1,7 +1,7 @@
 //! `amem doctor`: coexistence, capability, and store health report.
 //!
-//! Read-only except the store writability probe (temp file round-trip).
-//! Exit 0 with warnings — doctor diagnoses, it never fails the shell.
+//! Strictly read-only: it must never create the store, the DB, or the
+//! device id. Exit 0 with warnings — doctor diagnoses, never fails.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};

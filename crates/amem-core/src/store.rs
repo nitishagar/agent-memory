@@ -4,6 +4,10 @@
 //! dedup hints only. WAL mode + `busy_timeout` + single-statement
 //! transactions keep concurrent readers unblocked and writers serialized on
 //! every OS — no `flock`, no hand-rolled locks.
+//!
+//! No tamper-evidence: `hash` is never verified on read, so anyone with
+//! DB write access can rewrite payloads undetectably. The trust boundary
+//! is the OS file permissions on the store dir (0700/0600 on unix).
 
 use std::path::Path;
 
@@ -59,25 +63,107 @@ pub struct Record {
 
 /// Read (or create, 0600) the stable device id for a store directory.
 ///
+/// Creation is atomic: the id file is opened `create_new` (0600 from
+/// birth on unix), so concurrent first runs converge — losers re-read
+/// the winner. Only a missing file triggers generation; any other read
+/// error propagates instead of clobbering a good id.
+///
 /// # Errors
 ///
 /// Returns [`Error::Io`] if the id file cannot be read or written.
 pub fn device_id(dir: &Path) -> Result<String> {
     let path = dir.join("device_id");
-    if let Ok(id) = std::fs::read_to_string(&path) {
-        let id = id.trim().to_string();
-        if !id.is_empty() {
-            return Ok(id);
+    // Three attempts: lost race + stale crash remnant + fresh create.
+    for _ in 0..3 {
+        match std::fs::read_to_string(&path) {
+            Ok(text) if !text.trim().is_empty() => return Ok(text.trim().to_string()),
+            Ok(_) => {
+                // Empty: either a live writer (wait) or a crash between
+                // `create_new` and write (take over). A live writer lands
+                // within milliseconds; a full second of emptiness is stale.
+                if wait_for_id(&path) {
+                    let text = std::fs::read_to_string(&path)?;
+                    return Ok(text.trim().to_string());
+                }
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::Io(e)),
+        }
+        std::fs::create_dir_all(dir)?;
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        match create_private(&path, format!("{id}\n").as_bytes()) {
+            Ok(()) => return Ok(id),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(Error::Io(e)),
         }
     }
-    let id = uuid::Uuid::new_v4().simple().to_string();
-    std::fs::write(&path, format!("{id}\n"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    // A lost race lands here with the winner's id on disk.
+    wait_for_id(&path);
+    let text = std::fs::read_to_string(&path)?;
+    Ok(text.trim().to_string())
+}
+
+/// Wait up to a second for a concurrent writer to land the id.
+/// True when the file is non-empty afterwards.
+fn wait_for_id(path: &Path) -> bool {
+    for _ in 0..100 {
+        match std::fs::read_to_string(path) {
+            Ok(text) if !text.trim().is_empty() => return true,
+            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(_) => return false,
+        }
     }
-    Ok(id)
+    false
+}
+
+/// Create a fresh private file, failing if it exists (unix: 0600).
+#[cfg(unix)]
+fn create_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// Create a fresh file, failing if it exists (non-unix: default ACLs).
+#[cfg(not(unix))]
+fn create_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// Best-effort owner-only permissions on the store tree (unix).
+/// `SQLite` creates `memory.db` 0644 under a normal umask; history must
+/// not be world-readable on shared machines.
+#[cfg(unix)]
+fn lock_down(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    for (path, mode) in [
+        (dir.to_path_buf(), 0o700),
+        (dir.join("spool"), 0o700),
+        (dir.join("memory.db"), 0o600),
+        (dir.join("memory.db-wal"), 0o600),
+        (dir.join("memory.db-shm"), 0o600),
+        (dir.join("device_id"), 0o600),
+    ] {
+        if path.exists() {
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+        }
+    }
 }
 
 /// The embedded store handle. Not `Sync`: share via message passing or one
@@ -100,6 +186,8 @@ impl Store {
     /// on-disk schema is newer than [`SCHEMA_VERSION`].
     pub fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        lock_down(dir);
         let conn = Connection::open_with_flags(
             dir.join("memory.db"),
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
@@ -107,9 +195,25 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS as u64))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
+        #[cfg(unix)]
+        lock_down(dir);
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Open an existing store strictly read-only: creates nothing, migrates
+    /// nothing. For `doctor`-style probes on initialized stores.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Db`] (including "unable to open" when `memory.db`
+    /// is absent — callers map that to "not initialized").
+    pub fn open_readonly(dir: &Path) -> Result<Self> {
+        let conn =
+            Connection::open_with_flags(dir.join("memory.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS as u64))?;
+        Ok(Self { conn })
     }
 
     fn migrate(&self) -> Result<()> {
@@ -127,8 +231,11 @@ impl Store {
             )));
         }
         if current < 1 {
+            // `IF NOT EXISTS` throughout: `execute_batch` auto-commits per
+            // statement, so a crash mid-migration reopens with tables
+            // present but version 0 — the rerun must converge, not brick.
             self.conn.execute_batch(
-                "CREATE TABLE records (
+                "CREATE TABLE IF NOT EXISTS records (
                     device TEXT NOT NULL,
                     stream TEXT NOT NULL,
                     idx INTEGER NOT NULL,
@@ -141,8 +248,8 @@ impl Store {
                     extras TEXT NOT NULL DEFAULT '{}',
                     PRIMARY KEY (device, stream, idx)
                 );
-                CREATE INDEX idx_records_stream_ts ON records (stream, ts_ns);
-                CREATE TABLE spool_ids (
+                CREATE INDEX IF NOT EXISTS idx_records_stream_ts ON records (stream, ts_ns);
+                CREATE TABLE IF NOT EXISTS spool_ids (
                     spool_id TEXT PRIMARY KEY,
                     device TEXT NOT NULL,
                     stream TEXT NOT NULL,
@@ -435,5 +542,68 @@ mod tests {
             Store::open(tmp.path()),
             Err(Error::InvalidArguments(_))
         ));
+    }
+
+    #[test]
+    fn torn_migration_converges_on_reopen() {
+        // Crash after CREATE TABLE but before the version row: tables
+        // present, version 0. Reopen must finish, not brick.
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let conn = Connection::open(tmp.path().join("memory.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+                 CREATE TABLE records (device TEXT NOT NULL, stream TEXT NOT NULL,
+                    idx INTEGER NOT NULL, ts_ns INTEGER NOT NULL,
+                    actor TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT 'command',
+                    payload TEXT NOT NULL, hash TEXT NOT NULL DEFAULT '',
+                    version INTEGER NOT NULL DEFAULT 1, extras TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (device, stream, idx));",
+            )
+            .unwrap();
+        }
+        let mut store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.insert_record(&sample("d1")).unwrap(), 0);
+    }
+
+    #[test]
+    fn empty_device_id_recovers() {
+        // Crash between create_new and write leaves a 0-byte id file.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("device_id"), "").unwrap();
+        let id = device_id(tmp.path()).unwrap();
+        assert_eq!(id.len(), 32);
+        assert_eq!(device_id(tmp.path()).unwrap(), id);
+    }
+
+    #[test]
+    fn readonly_open_creates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(Store::open_readonly(tmp.path()).is_err());
+        assert!(!tmp.path().join("memory.db").exists());
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.insert_record(&sample("d1")).unwrap();
+        drop(store);
+        let ro = Store::open_readonly(tmp.path()).unwrap();
+        assert_eq!(ro.count_stream("d1", "shell").unwrap(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_tree_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.insert_record(&sample("d1")).unwrap();
+        drop(store);
+        device_id(tmp.path()).unwrap();
+        for (rel, want) in [("", 0o700), ("memory.db", 0o600), ("device_id", 0o600)] {
+            let mode = std::fs::metadata(tmp.path().join(rel))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, want, "{rel} mode {mode:o}");
+        }
     }
 }

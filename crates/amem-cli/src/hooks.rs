@@ -27,7 +27,7 @@ pub fn snippet(shell: &str) -> Result<String> {
         )),
         "zsh" => Ok(ZSH_SNIPPET.to_string()),
         "fish" => Ok(FISH_SNIPPET.to_string()),
-        "powershell" => Ok(POWERSHELL_SNIPPET.to_string()),
+        "powershell" | "pwsh" => Ok(POWERSHELL_SNIPPET.to_string()),
         other => Err(Error::InvalidArguments(format!(
             "unknown shell '{other}': expected {}",
             supported().join(", ")

@@ -39,6 +39,11 @@ fn init_snippets_render_per_shell() {
     }
     let out = amem().args(["init", "tcsh"]).output().unwrap();
     assert!(!out.status.success());
+    // `pwsh` is an alias of `powershell`.
+    let a = amem().args(["init", "powershell"]).output().unwrap();
+    let b = amem().args(["init", "pwsh"]).output().unwrap();
+    assert!(b.status.success());
+    assert_eq!(a.stdout, b.stdout);
 }
 
 #[test]
@@ -249,6 +254,79 @@ fn start_via_stdin(store: &str, shell: &str, cmd_bytes: &[u8]) -> String {
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success());
     String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+#[test]
+fn history_rejects_unknown_shell() {
+    let (_tmp, store) = temp_store("s8");
+    let out = amem()
+        .args([
+            "--store-dir",
+            store.to_str().unwrap(),
+            "history",
+            "start",
+            "--shell",
+            "tcsh",
+            "--cmd",
+            "ls",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("unknown shell"), "stderr: {err}");
+}
+
+#[test]
+fn doctor_creates_nothing() {
+    let (tmp, store) = temp_store("s9");
+    assert!(!store.exists());
+    let out = amem()
+        .args(["--store-dir", store.to_str().unwrap(), "doctor"])
+        .env("HOME", tmp.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(!store.exists(), "doctor created the store");
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("not initialized"), "stdout: {text}");
+}
+
+#[test]
+fn sync_errors_never_echo_credentials() {
+    let (_tmp, store) = temp_store("s10");
+    let out = amem()
+        .args([
+            "--store-dir",
+            store.to_str().unwrap(),
+            "sync",
+            "--endpoint",
+            "http://user:secret@127.0.0.1:9/",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(!err.contains("secret"), "stderr leaks: {err}");
+    assert!(err.contains("127.0.0.1:9"), "stderr: {err}");
+}
+
+#[test]
+fn bad_redact_pattern_warns_instead_of_wedging() {
+    let (_tmp, store) = temp_store("s11");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("redact.json"), "{\"extra\": [\"([\"]}").unwrap();
+    let out = amem()
+        .args(["--store-dir", store.to_str().unwrap(), "ingest", "--once"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8(out.stderr).unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        out.status.success(),
+        "ingest wedged by bad pattern: stdout={stdout} stderr={err}"
+    );
+    assert!(err.contains("skipping redaction pattern"), "stderr: {err}");
 }
 
 #[test]

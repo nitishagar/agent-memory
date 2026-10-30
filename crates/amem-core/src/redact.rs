@@ -28,6 +28,14 @@ const DEFAULT_RULES: &[(&str, &str)] = &[
         "secret-assign",
         "(?i)\\b(api[_-]?key|api[_-]?secret|secret|token|passwd|password|auth[_-]?token|access[_-]?token)\\s*([:=])\\s*\\S+",
     ),
+    // Space-separated flags: `--token hunter2`. The dashes are required —
+    // a bare word + word (`token tomorrow`) is prose, not a secret. Group 1
+    // is the boundary char (no look-around in `regex`): it keeps the inner
+    // `-token` of `--with-token` from matching and is re-emitted verbatim.
+    (
+        "secret-flag",
+        "(?i)(^|[^A-Za-z0-9_-])(--?(?:api[_-]?key|api[_-]?secret|secret|token|passwd|password|auth[_-]?token|access[_-]?token))\\s+(\\S+)",
+    ),
 ];
 
 /// Redactor with compiled defaults plus user configuration.
@@ -76,12 +84,26 @@ impl Redactor {
     ///
     /// Returns [`Error::InvalidArguments`] if any pattern is not valid regex.
     pub fn with_extra(mut self, patterns: &[String]) -> Result<Self> {
-        for (i, pat) in patterns.iter().enumerate() {
-            let re = Regex::new(pat)
-                .map_err(|e| Error::InvalidArguments(format!("bad redaction pattern: {e}")))?;
-            self.extra.push((format!("user-{i}"), re));
+        for pat in patterns {
+            self.try_add_extra(pat)?;
         }
         Ok(self)
+    }
+
+    /// Add one user pattern, naming it `user-N` for its position.
+    ///
+    /// Unlike [`Self::with_extra`], a bad pattern fails only itself, so
+    /// callers can skip-and-warn instead of losing every custom rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArguments`] if the pattern is not valid regex.
+    pub fn try_add_extra(&mut self, pat: &str) -> Result<()> {
+        let re =
+            Regex::new(pat).map_err(|e| Error::InvalidArguments(format!("bad {pat:?}: {e}")))?;
+        let n = self.extra.len();
+        self.extra.push((format!("user-{n}"), re));
+        Ok(())
     }
 
     /// Scan `text`, returning redacted text plus whether anything matched.
@@ -111,6 +133,12 @@ impl Redactor {
                     out = re
                         .replace_all(&out, |caps: &regex::Captures| {
                             format!("{}{}{m}", &caps[1], &caps[2])
+                        })
+                        .into_owned();
+                } else if name == "secret-flag" {
+                    out = re
+                        .replace_all(&out, |caps: &regex::Captures| {
+                            format!("{}{} {m}", &caps[1], &caps[2])
                         })
                         .into_owned();
                 } else if name == "bearer" {
@@ -176,6 +204,17 @@ mod tests {
             "token=supersecretvalue123 deploy",
             "secret-assign",
             &["supersecretvalue123"],
+        ),
+        ("cli --token hunter2 run", "secret-flag", &["hunter2"]),
+        (
+            "curl --api-key [REDACTED] https://x",
+            "secret-flag",
+            &["[REDACTED]"],
+        ),
+        (
+            "mysql --password hunter3 db",
+            "secret-flag",
+            &["[REDACTED]"],
         ),
         (
             "xoxb-1234-5678-abcdEFGH test",
