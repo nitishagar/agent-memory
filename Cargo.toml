@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/amem-cli", "crates/amem-core"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/nitishagar/agent-memory"
+homepage = "https://github.com/nitishagar/agent-memory"
+readme = "../README.md"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
