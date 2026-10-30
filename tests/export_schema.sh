@@ -49,7 +49,7 @@ RECORD_KEYS = {"id", "stream", "actor", "hlc", "kind", "checksum", "redacted"}
 for p in files:
     text = p.read_text()
     m = re.match(r"---\n(.*?)\n---\n", text, re.S)
-    if p.stem in ("day-index",) or re.fullmatch(r"\d{4}-\d{2}-\d{2}", p.stem) or p.stem.startswith("session-"):
+    if p.stem in ("day-index", "quarantine-index") or re.fullmatch(r"\d{4}-\d{2}-\d{2}", p.stem) or p.stem.startswith("session-"):
         if m:
             errors.append(f"{p.name}: index page must not have record frontmatter")
     else:
@@ -99,7 +99,7 @@ day_pages = [s for s in stems if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s)]
 assert day_pages, "no day pages"
 sess_pages = [s for s in stems if s.startswith("session-")]
 assert sess_pages, "no session pages"
-records = stems - {"day-index"} - set(day_pages) - set(sess_pages)
+records = stems - {"day-index", "quarantine-index"} - set(day_pages) - set(sess_pages)
 assert records, "no record files"
 linked = set()
 for s in day_pages + sess_pages:

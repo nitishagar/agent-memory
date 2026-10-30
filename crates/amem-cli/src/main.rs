@@ -3,7 +3,7 @@ mod export;
 mod history;
 mod hooks;
 mod paths;
-mod sync_stub;
+mod sync_cli;
 
 use std::path::PathBuf;
 
@@ -59,17 +59,56 @@ enum Commands {
         /// Stream filter (`shell`, `transcript:claude`, ...; `%` = all).
         #[arg(long, default_value = "%")]
         stream: String,
+        /// Device filter (exact id, or `%` = whole team union).
+        #[arg(long, default_value = "%")]
+        device: String,
         /// Maximum records to print.
         #[arg(long, default_value = "20")]
         limit: i64,
     },
     /// Report store/hook/transcript health. Read-only, always exit 0.
     Doctor,
-    /// Probe a sync endpoint (Phase 1: validation stub, no transport yet).
+    /// Sync with a self-hosted server (TLS-only).
     Sync {
-        /// Sync server endpoint URL.
+        /// Sync server endpoint URL (https://host:port).
         #[arg(long)]
         endpoint: String,
+        /// Adopt a changed server generation and re-sync (needs --confirm).
+        #[arg(long)]
+        recover: bool,
+        /// Confirm --recover (it re-pushes local records to a fresh union).
+        #[arg(long)]
+        confirm: bool,
+        /// Pin an unknown server certificate on first contact (TOFU).
+        #[arg(long)]
+        trust_new: bool,
+    },
+    /// Run the self-hosted sync server (TLS-only).
+    SyncServer {
+        /// Server dir (server.db + cert.pem/key.pem).
+        #[arg(long)]
+        dir: PathBuf,
+        /// Listen address.
+        #[arg(long, default_value = "127.0.0.1:8443")]
+        listen: String,
+        /// Generate a self-signed cert into --dir and exit (prints fingerprint).
+        #[arg(long)]
+        init_cert: bool,
+    },
+    /// List conflict branches (JSON).
+    Branches,
+    /// Quarantine a record out of recall (no id: list quarantine).
+    Quarantine {
+        /// device/stream/idx triple or external id.
+        id: Option<String>,
+        /// Reason recorded with the quarantine.
+        #[arg(long, default_value = "manual")]
+        reason: String,
+    },
+    /// Restore a quarantined record (branches on occupant conflict).
+    Unquarantine {
+        /// device/stream/idx triple or envelope id.
+        id: String,
     },
     /// Print a random id (hook sessions, test fixtures).
     #[command(hide = true)]
@@ -327,7 +366,13 @@ fn cmd_ingest(
 }
 
 /// `search`: read-only substring search, newest first.
-fn cmd_search(store: &std::path::Path, query: &str, stream: &str, limit: i64) -> Result<()> {
+fn cmd_search(
+    store: &std::path::Path,
+    query: &str,
+    stream: &str,
+    device: &str,
+    limit: i64,
+) -> Result<()> {
     let limit = limit.clamp(1, 200);
     if !store.join("memory.db").exists() {
         return Err(Error::NotFound(
@@ -335,20 +380,13 @@ fn cmd_search(store: &std::path::Path, query: &str, stream: &str, limit: i64) ->
         ));
     }
     let db = amem_core::store::Store::open_readonly(store)?;
-    let device = std::fs::read_to_string(store.join("device_id"))
-        .map(|d| d.trim().to_string())
-        .unwrap_or_default();
-    if device.is_empty() {
-        return Err(Error::NotFound(
-            "store not initialized; nothing to search".to_string(),
-        ));
-    }
-    for rec in db.search_stream(&device, stream, query, limit)? {
+    for rec in db.search_stream(device, stream, query, limit)? {
         println!("{}", render_hit(&rec));
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn run() -> Result<()> {
     // `serde` derive lives in amem-core; the CLI needs it for RedactConfig.
     let cli = Cli::parse();
@@ -407,8 +445,9 @@ fn run() -> Result<()> {
         Some(Commands::Search {
             query,
             stream,
+            device,
             limit,
-        }) => cmd_search(&store, &query, &stream, limit),
+        }) => cmd_search(&store, &query, &stream, &device, limit),
         Some(Commands::Doctor) => {
             let spool_n =
                 amem_core::spool::pending_spools(&paths::spool_dir(&store)).map_or(0, |v| v.len());
@@ -426,16 +465,47 @@ fn run() -> Result<()> {
             print!("{}", doctor::report(&store, spool_n, count));
             Ok(())
         }
-        Some(Commands::Sync { endpoint }) => {
-            println!("{}", sync_stub::check(&endpoint)?);
+        Some(Commands::Sync {
+            endpoint,
+            recover,
+            confirm,
+            trust_new,
+        }) => {
+            if recover && !confirm {
+                return Err(Error::InvalidArguments(
+                    "--recover needs --confirm: it adopts the server generation and re-pushes local records".to_string(),
+                ));
+            }
+            let s = amem_sync::run_sync(&store, &endpoint, recover, trust_new)?;
+            println!(
+                "{{\"uploaded\":{},\"downloaded\":{},\"duplicates\":{},\"conflicts\":{},\"quarantined\":{},\"branches\":{}}}",
+                s.uploaded, s.downloaded, s.duplicates, s.conflicts, s.quarantined, s.branches
+            );
             Ok(())
         }
+        Some(Commands::SyncServer {
+            dir,
+            listen,
+            init_cert,
+        }) => {
+            if init_cert {
+                let fp = amem_sync_server::cert::init_cert(&dir)?;
+                println!("{{\"fingerprint\":\"{fp}\"}}");
+                return Ok(());
+            }
+            amem_sync_server::server::serve_blocking(&dir, &listen)
+        }
+        Some(Commands::Branches) => sync_cli::branches(&store),
+        Some(Commands::Quarantine { id, reason }) => {
+            sync_cli::quarantine(&store, id.as_deref(), &reason)
+        }
+        Some(Commands::Unquarantine { id }) => sync_cli::unquarantine(&store, &id),
         Some(Commands::Mcp) => amem_mcp::server::serve_stdio(&store),
         Some(Commands::Export { vault }) => {
             let stats = export::export_vault(&store, &vault)?;
             println!(
-                "{{\"files\":{},\"days\":{},\"sessions\":{}}}",
-                stats.files, stats.days, stats.sessions
+                "{{\"files\":{},\"days\":{},\"sessions\":{},\"quarantined\":{}}}",
+                stats.files, stats.days, stats.sessions, stats.quarantined
             );
             Ok(())
         }

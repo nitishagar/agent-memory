@@ -100,7 +100,7 @@ fn history_spool_to_ingest_roundtrip() {
 fn sync_bogus_endpoints_fail_typed() {
     let (_tmp, store) = temp_store("s2");
     let store = store.to_str().unwrap().to_string();
-    // Refused (nothing listens on :9).
+    // Plain http is refused before any network attempt (TLS-only).
     let out = amem()
         .args([
             "--store-dir",
@@ -113,57 +113,64 @@ fn sync_bogus_endpoints_fail_typed() {
         .unwrap();
     assert!(!out.status.success());
     let err = String::from_utf8(out.stderr).unwrap();
-    assert!(err.contains("SYNC_ERROR"), "stderr: {err}");
-    // Unresolvable host → distinct DNS error.
+    assert!(err.contains("TLS-only"), "stderr: {err}");
+    // Unknown server: no pin, no --trust-new → no network, typed guidance.
     let out = amem()
         .args([
             "--store-dir",
             &store,
             "sync",
             "--endpoint",
-            "http://nonexistent.invalid/",
+            "https://nonexistent.invalid/",
         ])
         .output()
         .unwrap();
     assert!(!out.status.success());
     let err = String::from_utf8(out.stderr).unwrap();
-    assert!(err.contains("resolve"), "stderr: {err}");
-    // https explicitly deferred.
+    assert!(err.contains("unknown sync server"), "stderr: {err}");
+    assert!(err.contains("--trust-new"), "stderr: {err}");
+    // --trust-new dials directly: refused (nothing listens on :9).
     let out = amem()
         .args([
             "--store-dir",
             &store,
             "sync",
             "--endpoint",
-            "https://example.com/",
+            "https://127.0.0.1:9/",
+            "--trust-new",
         ])
         .output()
         .unwrap();
     assert!(!out.status.success());
     let err = String::from_utf8(out.stderr).unwrap();
-    assert!(err.contains("Phase 4"), "stderr: {err}");
+    assert!(err.contains("SYNC"), "stderr: {err}");
+    assert!(err.contains("127.0.0.1:9"), "stderr: {err}");
 }
 
 #[test]
 fn sync_ignores_proxy_env() {
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+    // Bogus proxy set: the client must dial the endpoint directly (and fail
+    // closed on refused), never route through or mention the proxy.
     let (_tmp, store) = temp_store("s3");
     let out = amem()
         .env("https_proxy", "http://bogus.invalid:9999")
+        .env("HTTPS_PROXY", "http://bogus.invalid:9999")
         .env("http_proxy", "http://bogus.invalid:9999")
+        .env("all_proxy", "http://bogus.invalid:9999")
         .args([
             "--store-dir",
             store.to_str().unwrap(),
             "sync",
             "--endpoint",
-            &format!("http://127.0.0.1:{port}/"),
+            "https://127.0.0.1:9/",
+            "--trust-new",
         ])
         .output()
         .unwrap();
-    assert!(out.status.success(), "proxy env leaked into sync");
-    drop(listener);
+    assert!(!out.status.success());
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(!err.contains("bogus"), "proxy env leaked: {err}");
+    assert!(err.contains("127.0.0.1:9"), "not a direct dial: {err}");
 }
 
 #[test]
@@ -435,7 +442,8 @@ fn sync_errors_never_echo_credentials() {
             store.to_str().unwrap(),
             "sync",
             "--endpoint",
-            "http://user:secret@127.0.0.1:9/",
+            "https://user:secret@127.0.0.1:9/",
+            "--trust-new",
         ])
         .output()
         .unwrap();
@@ -642,4 +650,156 @@ fn export_writes_resolvable_vault() {
     assert!(text.contains("[[session-ex]]"));
     assert!(text.contains("echo vault-me"));
     assert!(vault.join("session-ex.md").exists());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn quarantine_roundtrip_hides_and_restores() {
+    let (tmp, store) = temp_store("sq");
+    let store_s = store.to_str().unwrap().to_string();
+    let out = amem()
+        .args([
+            "--store-dir",
+            &store_s,
+            "history",
+            "start",
+            "--shell",
+            "bash",
+            "--cmd",
+            "quarantine-me-please",
+            "--session",
+            "q",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let id = String::from_utf8(out.stdout).unwrap();
+    let st = amem()
+        .args([
+            "--store-dir",
+            &store_s,
+            "history",
+            "end",
+            "--id",
+            id.trim(),
+            "--exit",
+            "0",
+        ])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let st = amem()
+        .args([
+            "--store-dir",
+            &store_s,
+            "ingest",
+            "--once",
+            "--no-transcripts",
+        ])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    // Quarantine by external id; recall hides it.
+    let out = amem()
+        .args([
+            "--store-dir",
+            &store_s,
+            "quarantine",
+            id.trim(),
+            "--reason",
+            "test-q",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = amem()
+        .args(["--store-dir", &store_s, "search", "quarantine-me-please"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        out.stdout.is_empty(),
+        "quarantined record leaked into recall"
+    );
+    // Listed; exportable with the flag.
+    let out = amem()
+        .args(["--store-dir", &store_s, "quarantine"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8(out.stdout).unwrap().contains("test-q"));
+    let vault = tmp.path().join("vault");
+    let out = amem()
+        .args([
+            "--store-dir",
+            &store_s,
+            "export",
+            "--vault",
+            vault.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stats: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(stats["quarantined"], 1);
+    // Restored: recall works again.
+    let out = amem()
+        .args(["--store-dir", &store_s, "unquarantine", id.trim()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = amem()
+        .args(["--store-dir", &store_s, "search", "quarantine-me-please"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        !out.stdout.is_empty(),
+        "restored record missing from recall"
+    );
+}
+
+#[test]
+fn branches_lists_empty_initially() {
+    let (_tmp, store) = temp_store("sb");
+    let store_s = store.to_str().unwrap().to_string();
+    let out = amem()
+        .args([
+            "--store-dir",
+            &store_s,
+            "history",
+            "start",
+            "--shell",
+            "bash",
+            "--cmd",
+            "x",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let st = amem()
+        .args([
+            "--store-dir",
+            &store_s,
+            "ingest",
+            "--once",
+            "--no-transcripts",
+        ])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let out = amem()
+        .args(["--store-dir", &store_s, "branches"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["branches"].as_array().unwrap().len(), 0);
 }

@@ -13,6 +13,8 @@ path = "src/main.rs"
 [dependencies]
 amem-core = { path = "../amem-core" }
 amem-mcp = { path = "../amem-mcp" }
+amem-sync = { path = "../amem-sync" }
+amem-sync-server = { path = "../amem-sync-server" }
 clap = { version = "4", features = ["derive"] }
 hostname = "0.4"
 serde = { version = "1.0.229", features = ["derive"] }

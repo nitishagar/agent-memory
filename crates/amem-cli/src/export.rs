@@ -19,6 +19,8 @@ pub struct Stats {
     pub days: usize,
     /// Session pages written.
     pub sessions: usize,
+    /// Quarantined files written (subset of `files`).
+    pub quarantined: usize,
 }
 
 /// Export `store_dir` into `vault` (created; files overwritten).
@@ -27,6 +29,7 @@ pub struct Stats {
 ///
 /// Returns [`Error::NotFound`] on an uninitialized store, [`Error::Db`]
 /// on store failure, [`Error::Io`] on write failure.
+#[allow(clippy::too_many_lines)]
 pub fn export_vault(store_dir: &Path, vault: &Path) -> Result<Stats> {
     if !store_dir.join("memory.db").exists() {
         return Err(Error::NotFound(
@@ -38,12 +41,25 @@ pub fn export_vault(store_dir: &Path, vault: &Path) -> Result<Stats> {
         .map(|d| d.trim().to_string())
         .unwrap_or_default();
     let records = db.list_all(&device)?;
+    // Quarantine renders as pseudo-records (flagged, never silently dropped).
+    let mut items: Vec<(amem_core::store::Record, String, bool)> = Vec::new();
+    for rec in records {
+        let ext = db
+            .external_id(&device, &rec.stream, rec.idx)?
+            .unwrap_or_else(|| format!("{}#{}", rec.stream, rec.idx));
+        items.push((rec, ext, false));
+    }
+    for q in db.quarantine_list()? {
+        if let Some((rec, ext)) = quarantine_pseudo(&q) {
+            items.push((rec, ext, true));
+        }
+    }
     std::fs::create_dir_all(vault)?;
 
     // Pre-pass: session page stems, disambiguating `safe()` collisions
     // with a hash suffix, so record files link exact pages.
     let mut session_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for rec in &records {
+    for (rec, _, _) in &items {
         let payload: serde_json::Value =
             serde_json::from_str(&rec.payload).unwrap_or(serde_json::Value::Null);
         session_names.insert(session_of(rec, &payload));
@@ -62,23 +78,39 @@ pub fn export_vault(store_dir: &Path, vault: &Path) -> Result<Stats> {
 
     let mut days: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     let mut sessions: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-    for rec in &records {
+    let mut quarantined: Vec<(String, String)> = Vec::new();
+    for (rec, ext, is_q) in &items {
         let payload: serde_json::Value =
             serde_json::from_str(&rec.payload).unwrap_or(serde_json::Value::Null);
         let date = civil_date(rec.ts_ns);
         let slug = slug_for(rec, &payload);
-        let stem = format!("{date}-{slug}");
-        let ext = db
-            .external_id(&device, &rec.stream, rec.idx)?
-            .unwrap_or_else(|| format!("{}#{}", rec.stream, rec.idx));
+        let stem = if *is_q {
+            format!("{date}-q-{slug}")
+        } else {
+            format!("{date}-{slug}")
+        };
         let session = session_of(rec, &payload);
         let title = title_for(rec, &payload);
-        let body = render_record(rec, &payload, &ext, &session, &page_for[&session], &title);
+        let body = render_record(
+            rec,
+            &payload,
+            ext,
+            &session,
+            &page_for[&session],
+            &title,
+            *is_q,
+        );
         std::fs::write(vault.join(format!("{stem}.md")), body)?;
         days.entry(date)
             .or_default()
             .push((stem.clone(), title.clone()));
-        sessions.entry(session).or_default().push((stem, title));
+        sessions
+            .entry(session)
+            .or_default()
+            .push((stem.clone(), title.clone()));
+        if *is_q {
+            quarantined.push((stem, title));
+        }
     }
 
     for (date, files) in &days {
@@ -102,11 +134,53 @@ pub fn export_vault(store_dir: &Path, vault: &Path) -> Result<Stats> {
         let stem = &page_for[session];
         std::fs::write(vault.join(format!("{stem}.md")), page)?;
     }
+    if !quarantined.is_empty() {
+        let mut page =
+            "# quarantine\n\n[[day-index]]\n\nHeld out of recall until restored:\n".to_string();
+        for (stem, title) in &quarantined {
+            let _ = writeln!(page, "- [[{stem}]] — {}", link_text(title));
+        }
+        std::fs::write(vault.join("quarantine-index.md"), page)?;
+    }
     Ok(Stats {
-        files: records.len(),
+        files: items.len(),
         days: days.len(),
         sessions: sessions.len(),
+        quarantined: quarantined.len(),
     })
+}
+
+/// A quarantined envelope as an exportable pseudo-record + its ext id.
+fn quarantine_pseudo(
+    q: &amem_core::store::Quarantined,
+) -> Option<(amem_core::store::Record, String)> {
+    let env = serde_json::from_str::<serde_json::Value>(&q.envelope).ok()?;
+    let str_field = |key: &str| {
+        env.get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let payload = env
+        .get("payload")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    Some((
+        amem_core::store::Record {
+            device: q.device.clone(),
+            stream: q.stream.clone(),
+            idx: q.idx,
+            ts_ns: env
+                .get("ts_ns")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(q.ts_ns),
+            actor: str_field("actor"),
+            kind: str_field("kind"),
+            payload: payload.to_string(),
+            hash: str_field("hash"),
+        },
+        str_field("id"),
+    ))
 }
 
 fn slug_for(rec: &amem_core::store::Record, payload: &serde_json::Value) -> String {
@@ -121,7 +195,8 @@ fn slug_for(rec: &amem_core::store::Record, payload: &serde_json::Value) -> Stri
         if id.is_empty() {
             return format!("note-{}", rec.idx);
         }
-        return format!("note-{}", safe(id));
+        // `idx` disambiguates versions of one id (append-only history).
+        return format!("note-{}-{}", safe(id), rec.idx);
     }
     let source = rec.stream.strip_prefix("transcript:").unwrap_or("tx");
     format!("tx-{}-{}", safe(source), rec.idx)
@@ -185,13 +260,14 @@ fn render_record(
     session: &str,
     session_page: &str,
     title: &str,
+    quarantined: bool,
 ) -> String {
     let redacted = payload
         .get("redacted")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let mut fm = format!(
-        "---\nid: {}\nstream: {}\nactor: {}\nhlc: {}\nkind: {}\nchecksum: {}\nredacted: {}\n",
+        "---\nid: {}\nstream: {}\nactor: {}\nhlc: {}\nkind: {}\nchecksum: {}\nredacted: {}\nquarantined: {}\n",
         yml(ext),
         yml(&rec.stream),
         yml(&rec.actor),
@@ -199,6 +275,7 @@ fn render_record(
         yml(&rec.kind),
         yml(&rec.hash),
         redacted,
+        quarantined,
     );
     let content = if rec.stream == "shell" {
         let exit_code = payload.get("exit").map_or_else(

@@ -36,7 +36,14 @@ pub fn first_line(s: &str) -> String {
 /// text line. Multibyte-safe: the session short is char- (not byte-)
 /// sliced, and every field is sanitized.
 #[must_use]
+/// One hit line plus the owning device (short id): recall is
+/// union-wide, so foreign records must be attributable.
 pub fn render_hit(rec: &crate::store::Record) -> String {
+    let dev: String = rec.device.chars().take(8).collect();
+    format!("{} @{}", render_hit_body(rec), dev)
+}
+
+fn render_hit_body(rec: &crate::store::Record) -> String {
     let payload: serde_json::Value =
         serde_json::from_str(&rec.payload).unwrap_or(serde_json::Value::Null);
     if rec.stream == "shell" {

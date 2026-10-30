@@ -118,12 +118,8 @@ impl Mem {
         format: Format,
     ) -> Result<String> {
         let db = self.read_store()?;
-        let hits = db.search_stream(
-            &self.device,
-            stream.unwrap_or("%"),
-            query,
-            limit.clamp(1, 200),
-        )?;
+        // Union-wide recall: teammates' synced records are searchable.
+        let hits = db.search_stream("%", stream.unwrap_or("%"), query, limit.clamp(1, 200))?;
         Ok(match format {
             Format::Text => {
                 if hits.is_empty() {
@@ -148,11 +144,21 @@ impl Mem {
         let db = self.read_store()?;
         let (stream, idx) = db.resolve_external(&self.device, id, stream)?;
         let rec = db.get_record(&self.device, &stream, idx)?;
+        // Conflict flag: branches claiming this record's external id.
+        let ext = db
+            .external_id(&self.device, &stream, idx)?
+            .unwrap_or_default();
+        let open: Vec<i64> = db
+            .branch_list()?
+            .iter()
+            .filter(|b| !b.ext_id.is_empty() && b.ext_id == ext)
+            .map(|b| b.id)
+            .collect();
         Ok(match format {
             Format::Text => {
                 let payload: serde_json::Value =
                     serde_json::from_str(&rec.payload).unwrap_or(serde_json::Value::Null);
-                format!(
+                let mut out = format!(
                     "id: {id}\nstream: {}\nidx: {}\nts_ns: {}\nactor: {}\nkind: {}\nchecksum: {}\nbody:\n{}",
                     sanitize(&rec.stream),
                     rec.idx,
@@ -161,9 +167,23 @@ impl Mem {
                     sanitize(&rec.kind),
                     rec.hash,
                     sanitize(&payload.to_string()),
-                )
+                );
+                if !open.is_empty() {
+                    use std::fmt::Write as _;
+                    let _ = writeln!(
+                        out,
+                        "\nconflicted: {} open branch(es), see `amem branches`",
+                        open.len()
+                    );
+                }
+                out
             }
-            Format::Json => record_json(&rec).to_string(),
+            Format::Json => {
+                let mut v = record_json(&rec);
+                v["conflicted"] = serde_json::Value::from(!open.is_empty());
+                v["branches"] = serde_json::json!(open);
+                v.to_string()
+            }
         })
     }
 
@@ -282,10 +302,10 @@ impl Mem {
                 )));
             }
             (Some(idx), Some(sum)) => {
-                let hash = db
+                let (new_idx, hash) = db
                     .note_update_guarded(&self.device, idx, sum, title, text)
                     .map_err(|e| store::busy_to_unknown(e, "note update"))?;
-                (idx, hash, false)
+                (new_idx, hash, false)
             }
         };
         let (idx, hash, created) = out;
@@ -375,6 +395,7 @@ fn record_json(rec: &Record) -> serde_json::Value {
     let payload: serde_json::Value =
         serde_json::from_str(&rec.payload).unwrap_or(serde_json::Value::Null);
     serde_json::json!({
+        "device": rec.device,
         "stream": rec.stream,
         "idx": rec.idx,
         "ts_ns": rec.ts_ns,

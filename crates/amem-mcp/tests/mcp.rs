@@ -65,7 +65,7 @@ fn guards_stale_write_rejected_reread_resubmit_succeeds() {
     let fresh = checksum_of(&mem, "n1");
     assert_eq!(
         mem.delete("n1", None, &fresh, Format::Text).unwrap(),
-        "deleted notes#0"
+        "deleted notes#1"
     );
     assert_eq!(
         mem.read("n1", None, Format::Text).unwrap_err().code(),
