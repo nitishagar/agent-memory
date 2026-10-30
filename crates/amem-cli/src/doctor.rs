@@ -17,7 +17,7 @@ const FOREIGN_HOOK_MARKERS: &[(&str, &str)] = &[
 /// rc files consulted per shell (Linux-first; macOS/Windows differ only in
 /// the PowerShell profile path, handled below).
 fn rc_files() -> Vec<(&'static str, PathBuf)> {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    let home = amem_core::dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
     let mut out = vec![
         ("bash", home.join(".bashrc")),
         ("zsh", home.join(".zshrc")),
@@ -38,9 +38,9 @@ fn rc_files() -> Vec<(&'static str, PathBuf)> {
 
 /// Known agent transcript locations (existence probe only).
 fn transcript_dirs() -> Vec<(&'static str, PathBuf)> {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
-    let data = dirs::data_dir().unwrap_or_else(|| home.join(".local/share"));
-    let config = dirs::config_dir().unwrap_or_else(|| home.join(".config"));
+    let home = amem_core::dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    let data = amem_core::dirs::data_dir().unwrap_or_else(|| home.join(".local/share"));
+    let config = amem_core::dirs::config_dir().unwrap_or_else(|| home.join(".config"));
     vec![
         ("claude", home.join(".claude/projects")),
         ("codex", home.join(".codex")),

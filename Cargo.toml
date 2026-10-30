@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/amem-cli", "crates/amem-core"]
+members = ["crates/amem-cli", "crates/amem-core", "crates/amem-mcp"]
 
 [workspace.package]
 edition = "2024"

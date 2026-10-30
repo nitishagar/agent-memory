@@ -16,7 +16,7 @@ pub fn store_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
             return Ok(PathBuf::from(env));
         }
     }
-    dirs::data_dir()
+    amem_core::dirs::data_dir()
         .map(|d| d.join("agent-memory"))
         .ok_or_else(|| Error::InvalidArguments("cannot locate OS data directory".to_string()))
 }

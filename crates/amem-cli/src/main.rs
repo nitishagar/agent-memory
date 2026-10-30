@@ -1,4 +1,5 @@
 mod doctor;
+mod export;
 mod history;
 mod hooks;
 mod paths;
@@ -6,6 +7,7 @@ mod sync_stub;
 
 use std::path::PathBuf;
 
+use amem_core::display::sanitize;
 use amem_core::error::{Error, Result};
 use clap::{Parser, Subcommand};
 
@@ -72,6 +74,14 @@ enum Commands {
     /// Print a random id (hook sessions, test fixtures).
     #[command(hide = true)]
     Uuid,
+    /// Serve the MCP tools over stdio (for agent configs).
+    Mcp,
+    /// Export the store as an Obsidian-openable Markdown vault.
+    Export {
+        /// Vault directory to write (created; files overwritten).
+        #[arg(long)]
+        vault: PathBuf,
+    },
 }
 
 #[derive(Parser)]
@@ -269,75 +279,9 @@ fn run_transcripts(
     Ok(())
 }
 
-/// One human-readable search hit line. Shapes differ per stream, so the
-/// payload is sniffed: shell records show `cmd`, transcripts show
-/// `source/session/role` plus the first text line.
+/// One human-readable search hit line (shared with the MCP server).
 fn render_hit(rec: &amem_core::store::Record) -> String {
-    let payload: serde_json::Value =
-        serde_json::from_str(&rec.payload).unwrap_or(serde_json::Value::Null);
-    let first_line = |s: &str| {
-        let line = s.lines().next().unwrap_or_default();
-        if line.chars().count() > 160 {
-            sanitize(&format!("{}…", line.chars().take(160).collect::<String>()))
-        } else {
-            sanitize(line)
-        }
-    };
-    if rec.stream == "shell" {
-        let cmd = payload
-            .get("cmd")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("?");
-        let exit = payload.get("exit").and_then(serde_json::Value::as_i64);
-        return format!(
-            "[shell #{}] {} (exit {})",
-            rec.idx,
-            first_line(cmd),
-            exit.map_or_else(|| "?".to_string(), |e| e.to_string())
-        );
-    }
-    let source = payload
-        .get("source")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("?");
-    let session = payload
-        .get("session")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("?");
-    let role = payload
-        .get("role")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("?");
-    let text = payload
-        .get("text")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let short: String = session.chars().take(8).collect();
-    format!(
-        "[{} #{}] {} {}: {}",
-        sanitize(source),
-        rec.idx,
-        sanitize(&short),
-        sanitize(role),
-        first_line(text)
-    )
-}
-
-/// Sanitize hostile strings for terminal display: control characters
-/// (including ESC and `\r`) become U+FFFD, output capped at 300 chars.
-/// Transcript content is attacker-controlled; logs and hits must not
-/// carry escape sequences or forged lines.
-fn sanitize(s: &str) -> String {
-    let clean: String = s
-        .chars()
-        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
-        .take(300)
-        .collect();
-    if s.chars().count() > 300 {
-        format!("{clean}…")
-    } else {
-        clean
-    }
+    amem_core::display::render_hit(rec)
 }
 
 /// `ingest --once`: spool pass, then the six-source transcript pass.
@@ -484,6 +428,15 @@ fn run() -> Result<()> {
         }
         Some(Commands::Sync { endpoint }) => {
             println!("{}", sync_stub::check(&endpoint)?);
+            Ok(())
+        }
+        Some(Commands::Mcp) => amem_mcp::server::serve_stdio(&store),
+        Some(Commands::Export { vault }) => {
+            let stats = export::export_vault(&store, &vault)?;
+            println!(
+                "{{\"files\":{},\"days\":{},\"sessions\":{}}}",
+                stats.files, stats.days, stats.sessions
+            );
             Ok(())
         }
         Some(Commands::Uuid) => {

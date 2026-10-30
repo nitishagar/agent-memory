@@ -509,9 +509,9 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// treat a missing root as "source not installed", not an error.
 #[must_use]
 pub fn default_root(source: Source) -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    let data = dirs::data_dir().unwrap_or_else(|| home.join(".local/share"));
-    let config = dirs::config_dir().unwrap_or_else(|| home.join(".config"));
+    let home = crate::dirs::home_dir()?;
+    let data = crate::dirs::data_dir().unwrap_or_else(|| home.join(".local/share"));
+    let config = crate::dirs::config_dir().unwrap_or_else(|| home.join(".config"));
     Some(match source {
         Source::Claude => home.join(".claude/projects"),
         Source::Codex => std::env::var_os("CODEX_HOME")

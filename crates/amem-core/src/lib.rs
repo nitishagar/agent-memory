@@ -5,6 +5,8 @@
 //! the network.
 
 pub mod clock;
+pub mod dirs;
+pub mod display;
 pub mod error;
 pub mod git;
 pub mod ingest;

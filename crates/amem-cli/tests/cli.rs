@@ -548,3 +548,98 @@ fn history_start_stdin_strips_one_trailing_newline() {
     let payload: serde_json::Value = serde_json::from_str(&rec.payload).unwrap();
     assert_eq!(payload["cmd"], "echo hi");
 }
+
+#[test]
+fn export_writes_resolvable_vault() {
+    let (tmp, store) = temp_store("sx");
+    let store_s = store.to_str().unwrap().to_string();
+    let out = amem()
+        .args([
+            "--store-dir",
+            &store_s,
+            "history",
+            "start",
+            "--shell",
+            "bash",
+            "--cmd",
+            "echo vault-me",
+            "--session",
+            "ex",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let id = String::from_utf8(out.stdout).unwrap();
+    let st = amem()
+        .args([
+            "--store-dir",
+            &store_s,
+            "history",
+            "end",
+            "--id",
+            id.trim(),
+            "--exit",
+            "0",
+        ])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let st = amem()
+        .args([
+            "--store-dir",
+            &store_s,
+            "ingest",
+            "--once",
+            "--no-transcripts",
+        ])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let vault = tmp.path().join("vault");
+    let out = amem()
+        .args([
+            "--store-dir",
+            &store_s,
+            "export",
+            "--vault",
+            vault.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stats: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(stats["files"], 1);
+    assert!(vault.join("day-index.md").exists());
+    let recs: Vec<PathBuf> = std::fs::read_dir(&vault)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.contains("-sh-"))
+        })
+        .collect();
+    assert_eq!(recs.len(), 1);
+    let text = std::fs::read_to_string(&recs[0]).unwrap();
+    for key in [
+        "id:",
+        "stream:",
+        "actor:",
+        "hlc:",
+        "cmd:",
+        "exit:",
+        "session:",
+        "shell:",
+        "redacted:",
+    ] {
+        assert!(text.contains(key), "missing {key}");
+    }
+    assert!(text.contains("[[day-index]]"));
+    assert!(text.contains("[[session-ex]]"));
+    assert!(text.contains("echo vault-me"));
+    assert!(vault.join("session-ex.md").exists());
+}
