@@ -1,0 +1,62 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: amem-x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: amem-aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: amem-x86_64-pc-windows-msvc.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release -p amem-cli --target ${{ matrix.target }}
+      - if: runner.os != 'Windows'
+        run: ./tests/install_smoke.sh ./target/${{ matrix.target }}/release/amem
+      - name: package
+        shell: bash
+        run: |
+          mkdir -p dist
+          bin="target/${{ matrix.target }}/release/amem${{ runner.os == 'Windows' && '.exe' || '' }}"
+          cp "$bin" "dist/${{ matrix.name }}"
+          (cd dist && sha256sum "${{ matrix.name }}" > "${{ matrix.name }}.sha256")
+          ls -la dist
+          sz=$(wc -c < "dist/${{ matrix.name }}")
+          echo "size=$sz"
+          [ "$sz" -le 26214400 ] || { echo "binary exceeds 25MB"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ls -la dist && sha256sum -c dist/*.sha256
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

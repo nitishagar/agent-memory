@@ -38,3 +38,21 @@ jobs:
         run: ./tests/export_schema.sh ./target/debug/amem
       - if: runner.os != 'Windows'
         run: ./tests/e2e_phase3.sh ./target/debug/amem
+      - if: runner.os != 'Windows'
+        run: ./tests/tls_refusal.sh ./target/debug/amem
+      - if: runner.os != 'Windows'
+        run: ./tests/e2e_phase4.sh ./target/debug/amem
+      - if: runner.os != 'Windows'
+        run: ./tests/install_smoke.sh ./target/debug/amem
+      - if: runner.os == 'Linux'
+        run: ./tests/docs_smoke.sh ./target/debug/amem
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: structured fuzz (60s per target)
+        run: |
+          cargo test -p amem-core --test fuzz_targets -- --nocapture \
+            FUZZ_SECS=60 FUZZ_SEED=20261030 2>&1 | tail -5

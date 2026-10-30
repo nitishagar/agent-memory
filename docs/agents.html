@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agents — amem</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<nav class="top"><div class="wrap">
+  <a class="logo" href="index.html">amem<span>_</span></a>
+  <a class="nl" href="quickstart.html">Quickstart</a>
+  <a class="nl" href="agents.html">Agents</a>
+  <a class="nl" href="self-host.html">Self-host sync</a>
+  <a class="nl" href="security.html">Security</a>
+  <a class="nl" href="uninstall.html">Uninstall</a>
+  <span class="spacer"></span>
+  <a class="btn" href="https://github.com/nitishagar/agent-memory">GitHub</a>
+</div></nav>
+<div class="wrap page">
+<h1>Agents</h1>
+<p>amem serves six MCP tools over stdio: <code>mem_search</code>, <code>mem_read</code>,
+<code>mem_list</code>, <code>mem_write</code>, <code>mem_delete</code>, <code>mem_context</code>.
+Text by default, <code>format: "json"</code> on request. Recorder streams are read-only —
+only <code>notes</code> mutate, and mutations are checksum-guarded (stale guards refuse,
+never silent last-write-wins).</p>
+
+<h2>Claude Code</h2>
+<p><code>~/.claude.json</code>, under <code>mcpServers</code>:</p>
+<pre>{
+  "agent-memory": { "command": "/home/you/.local/bin/amem", "args": ["mcp"] }
+}</pre>
+
+<h2>Codex</h2>
+<p><code>~/.codex/config.toml</code>:</p>
+<pre>[mcp_servers.agent-memory]
+command = "/home/you/.local/bin/amem"
+args = ["mcp"]</pre>
+
+<h2>Cursor</h2>
+<p><code>~/.cursor/mcp.json</code>:</p>
+<pre>{
+  "mcpServers": {
+    "agent-memory": { "command": "/home/you/.local/bin/amem", "args": ["mcp"] }
+  }
+}</pre>
+
+<h2>OpenCode / ZCode</h2>
+<p><code>opencode.json</code> (or <code>zcode.json</code>) in your project:</p>
+<pre>{
+  "mcp": {
+    "agent-memory": {
+      "type": "local",
+      "command": ["/home/you/.local/bin/amem", "mcp"]
+    }
+  }
+}</pre>
+
+<h2>pi</h2>
+<p>pi reads MCP servers from its settings file — add an entry with command
+<code>/home/you/.local/bin/amem</code> and args <code>["mcp"]</code>,
+same shape as above.</p>
+
+<div class="note">Use the absolute path to your <code>amem</code> binary
+(<code>which amem</code>). Agents spawn it per session; there is no daemon to manage.</div>
+</div>
+<footer><div class="wrap">
+  <span>amem — Apache-2.0</span><span class="spacer"></span>
+  <a href="https://github.com/nitishagar/agent-memory">GitHub</a>
+</div></footer>
+</body>
+</html>

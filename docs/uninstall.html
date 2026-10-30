@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Uninstall — amem</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<nav class="top"><div class="wrap">
+  <a class="logo" href="index.html">amem<span>_</span></a>
+  <a class="nl" href="quickstart.html">Quickstart</a>
+  <a class="nl" href="agents.html">Agents</a>
+  <a class="nl" href="self-host.html">Self-host sync</a>
+  <a class="nl" href="security.html">Security</a>
+  <a class="nl" href="uninstall.html">Uninstall</a>
+  <span class="spacer"></span>
+  <a class="btn" href="https://github.com/nitishagar/agent-memory">GitHub</a>
+</div></nav>
+<div class="wrap page">
+<h1>Uninstall</h1>
+<p>amem keeps no daemons, no launchers, and no files outside the three places below.
+Removal leaves zero rc residue.</p>
+
+<h2>1. Remove the shell hook</h2>
+<p>Delete the <code>amem init</code> line you added to your rc file
+(<code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>~/.config/fish/config.fish</code>,
+or your PowerShell <code>$PROFILE</code>), then restart your shell.</p>
+
+<h2>2. Remove the data</h2>
+<pre><span class="prompt">$ </span>rm -rf ~/.local/share/agent-memory   <span class="prompt">#</span> Linux
+<span class="prompt">$ </span>rm -rf ~/Library/Application\ Support/agent-memory   <span class="prompt">#</span> macOS
+<span class="prompt">$ </span>rm -rf ~/.agent-memory   <span class="prompt">#</span> fallback / portable</pre>
+<p>Export first if you want to keep anything: <code>amem export --vault ~/memory-vault</code>
+produces plain Markdown that opens in Obsidian.</p>
+
+<h2>3. Remove the binary</h2>
+<pre><span class="prompt">$ </span>rm ~/.local/bin/amem   <span class="prompt">#</span> or: cargo uninstall amem-cli</pre>
+
+<h2>4. Remove agent configs (optional)</h2>
+<p>Delete the <code>agent-memory</code> entry from each MCP config you edited
+(see <a href="agents.html">Agents</a>). Agents simply stop offering the tools.</p>
+</div>
+<footer><div class="wrap">
+  <span>amem — Apache-2.0</span><span class="spacer"></span>
+  <a href="https://github.com/nitishagar/agent-memory">GitHub</a>
+</div></footer>
+</body>
+</html>

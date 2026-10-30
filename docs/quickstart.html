@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quickstart — amem</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<nav class="top"><div class="wrap">
+  <a class="logo" href="index.html">amem<span>_</span></a>
+  <a class="nl" href="quickstart.html">Quickstart</a>
+  <a class="nl" href="agents.html">Agents</a>
+  <a class="nl" href="self-host.html">Self-host sync</a>
+  <a class="nl" href="security.html">Security</a>
+  <a class="nl" href="uninstall.html">Uninstall</a>
+  <span class="spacer"></span>
+  <a class="btn" href="https://github.com/nitishagar/agent-memory">GitHub</a>
+</div></nav>
+<div class="wrap page">
+<h1>Quickstart</h1>
+<p>Five minutes from zero to searchable history. Everything stays on your machine.</p>
+
+<h2>1. Install</h2>
+<pre><span class="prompt">$ </span>curl -fsSL https://nitishagar.github.io/agent-memory/install.sh | bash</pre>
+<p>This downloads the binary for your OS into <code>~/.local/bin</code> (created if needed).
+Prefer cargo? <code>cargo install --git https://github.com/nitishagar/agent-memory amem-cli</code></p>
+
+<h2>2. Hook up your shell</h2>
+<pre><span class="prompt">$ </span>amem init bash &gt;&gt; ~/.bashrc   <span class="prompt">#</span> or zsh, fish, powershell
+<span class="prompt">$ </span>exec "$SHELL"</pre>
+<p>Every command you run is now recorded with exit code, cwd, and duration.
+Secrets (<code>--password</code>, <code>AKIA…</code> keys, bearer tokens) are redacted before they touch disk.</p>
+
+<h2>3. Ingest and search</h2>
+<pre><span class="prompt">$ </span>amem ingest --once
+<span class="prompt">$ </span>amem search "cargo test"
+[shell #4] cargo test --workspace (exit 0) @a1b2c3d4</pre>
+<p><code>ingest --once</code> drains the spool plus your agent transcripts
+(Claude Code, Cursor, OpenCode, pi, ZCode, Codex) into the store.
+<code>search</code> recalls newest-first across the whole team union once you sync.</p>
+
+<h2>4. Give your agent memory</h2>
+<p>Add amem to your agent's MCP config (<a href="agents.html">per-agent snippets</a>),
+then ask it <em>"what did I try yesterday and why did it fail?"</em>.</p>
+
+<h2>5. Sync with your team (optional)</h2>
+<pre><span class="prompt">$ </span>amem sync --endpoint https://sync.internal:8443 --trust-new</pre>
+<p>See <a href="self-host.html">self-host sync</a> to run the server. First contact pins the
+server certificate (TOFU); later changes refuse loudly instead of leaking data.</p>
+
+<div class="note">Check health any time with <code>amem doctor</code> — read-only, always exit 0, safe to paste (mostly; it lists installed tools).</div>
+</div>
+<footer><div class="wrap">
+  <span>amem — Apache-2.0</span><span class="spacer"></span>
+  <a href="https://github.com/nitishagar/agent-memory">GitHub</a>
+</div></footer>
+</body>
+</html>

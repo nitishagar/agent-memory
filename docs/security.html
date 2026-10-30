@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Security model — amem</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<nav class="top"><div class="wrap">
+  <a class="logo" href="index.html">amem<span>_</span></a>
+  <a class="nl" href="quickstart.html">Quickstart</a>
+  <a class="nl" href="agents.html">Agents</a>
+  <a class="nl" href="self-host.html">Self-host sync</a>
+  <a class="nl" href="security.html">Security</a>
+  <a class="nl" href="uninstall.html">Uninstall</a>
+  <span class="spacer"></span>
+  <a class="btn" href="https://github.com/nitishagar/agent-memory">GitHub</a>
+</div></nav>
+<div class="wrap page">
+<h1>Security model</h1>
+<p>amem is local-first: capture, storage, and recall never leave your machine
+unless you run <code>sync</code>. This page states exactly what sync trusts,
+what it verifies, and what it deliberately does not do yet.</p>
+
+<h2>What sync guarantees</h2>
+<ul>
+<li><strong>TLS-only transport.</strong> <code>http://</code> endpoints are refused, never attempted. There is no cleartext mode and no proxy support (proxy env vars fail closed).</li>
+<li><strong>TOFU server pins.</strong> First contact pins the server certificate byte-for-byte (<code>sync_pins.json</code>, mode 0600, atomic writes). Later connects trust only the pinned bytes — no CAs, no PKI. Mismatches refuse with both fingerprints shown. Use <code>--expect-fingerprint</code> to verify first contact in scripts.</li>
+<li><strong>Payload integrity.</strong> Every envelope hash is verified on upload-build, server-post, and download-apply. Corrupt, oversize, malformed, future-dated, and clock-inconsistent envelopes quarantine with reasons — never silently applied, never silently dropped.</li>
+<li><strong>No silent merges.</strong> Same-id divergences branch (both versions kept); generation changes and rollbacks refuse loudly; recover is explicit (<code>--recover --confirm</code>) and reports what it will push.</li>
+<li><strong>Local lockdown.</strong> Store, server DB, pins, and keys are created 0600/0700 from the first byte. Secrets are redacted at capture, before disk.</li>
+</ul>
+
+<h2>What sync trusts (threat model)</h2>
+<ul>
+<li><strong>The server and your teammates are trusted for integrity.</strong> Envelopes are unsigned and unencrypted at rest on the server: a malicious server or peer can read, withhold, or forge record metadata. Payload hashes catch corruption, not malice.</li>
+<li><strong>The server has no client authentication.</strong> Anyone who can reach the port can read and write the whole union. Non-loopback binds require <code>--public --confirm</code>; do not expose the port beyond your team without an authenticating front proxy.</li>
+<li><strong>There are no quotas or rate limits.</strong> Request sizes are capped, but request counts, series counts (past a fan-out guard), and database growth are not. A malicious client can fill the server disk.</li>
+</ul>
+
+<h2>Planned hardening (not in MVP)</h2>
+<ul>
+<li>Signed envelopes (per-device keys; the real fix for peer forgery).</li>
+<li>End-to-end encryption envelope (the <code>e2e_envelope</code> field is reserved).</li>
+<li>Server auth (bearer minimum), per-device quotas, rate limiting.</li>
+<li>Union transparency (signed checkpoints so selective withholding is detectable).</li>
+</ul>
+
+<div class="note">Found a hole in what IS promised above? Open a security advisory on GitHub — transport, pinning, quarantine, and merge-integrity bugs are treated as P0.</div>
+</div>
+<footer><div class="wrap">
+  <span>amem — Apache-2.0</span><span class="spacer"></span>
+  <a href="https://github.com/nitishagar/agent-memory">GitHub</a>
+</div></footer>
+</body>
+</html>

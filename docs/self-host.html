@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Self-host sync — amem</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<nav class="top"><div class="wrap">
+  <a class="logo" href="index.html">amem<span>_</span></a>
+  <a class="nl" href="quickstart.html">Quickstart</a>
+  <a class="nl" href="agents.html">Agents</a>
+  <a class="nl" href="self-host.html">Self-host sync</a>
+  <a class="nl" href="security.html">Security</a>
+  <a class="nl" href="uninstall.html">Uninstall</a>
+  <span class="spacer"></span>
+  <a class="btn" href="https://github.com/nitishagar/agent-memory">GitHub</a>
+</div></nav>
+<div class="wrap page">
+<h1>Self-host sync</h1>
+<p>One server, many teammates. The server holds an immutable union of every
+member's records; clients merge it locally. Sync is TLS-only with certificate
+pinning — there is no cleartext mode and no proxy bypass.</p>
+
+<h2>1. Start the server</h2>
+<pre><span class="prompt">$ </span>amem sync-server --dir /srv/amem --init-cert
+{"fingerprint":"SHA256:…"}
+<span class="prompt">$ </span>amem sync-server --dir /srv/amem --listen 0.0.0.0:8443</pre>
+<p>Share the fingerprint with your team out of band. Run it under systemd,
+docker, or plain <code>nohup</code> — it is a single static-ish binary.</p>
+
+<h2>2. Connect clients</h2>
+<pre><span class="prompt">$ </span>amem sync --endpoint https://sync.internal:8443 --trust-new
+{"uploaded":128,"downloaded":431,"duplicates":0,"conflicts":0,"quarantined":0,"branches":1}</pre>
+<p>First contact pins the server certificate (TOFU, stored with mode 0600).
+Later syncs refuse on pin mismatch. Omit <code>--trust-new</code> after the first run.</p>
+
+<h2>3. How merges work</h2>
+<table>
+<tr><th>Situation</th><th>Behavior</th></tr>
+<tr><td>Same id, same bytes</td><td>Deduplicated silently.</td></tr>
+<tr><td>Same id, different bytes</td><td>Both kept; the loser is flagged in <code>amem branches</code> with <code>reason: "id"</code>. Nothing overwrites.</td></tr>
+<tr><td>Corrupt / oversize / future-dated envelope</td><td>Quarantined with a reason, hidden from recall, flagged in export. <code>amem unquarantine</code> restores.</td></tr>
+<tr><td>Server restored from an old backup</td><td>Clients refuse with a rollback error — restore the server, then sync again.</td></tr>
+<tr><td>Server wiped and re-created</td><td>Clients refuse with a divergence error; re-run with <code>--recover --confirm</code> to adopt the new union and re-push.</td></tr>
+</table>
+
+<h2>4. Operate</h2>
+<ul>
+<li>Back up <code>/srv/amem</code> (the union is one SQLite file plus the cert).</li>
+<li>To move hosts, copy the directory — the generation id moves with it, so clients keep syncing.</li>
+<li>To start over, delete the directory and re-run <code>--init-cert</code>; every client then needs one <code>--recover --confirm</code>.</li>
+</ul>
+
+<div class="note">A hosted sync tier (no server to run) is planned as a paid option later. Self-hosted sync stays free and open source forever.</div>
+</div>
+<footer><div class="wrap">
+  <span>amem — Apache-2.0</span><span class="spacer"></span>
+  <a href="https://github.com/nitishagar/agent-memory">GitHub</a>
+</div></footer>
+</body>
+</html>

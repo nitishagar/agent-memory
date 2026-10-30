@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>amem — team memory for coding agents</title>
+<meta name="description" content="amem records shell history and agent transcripts on your machine, serves them to any MCP agent, and syncs across your team over TLS. Open source, Apache-2.0.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<nav class="top"><div class="wrap">
+  <a class="logo" href="index.html">amem<span>_</span></a>
+  <a class="nl" href="quickstart.html">Quickstart</a>
+  <a class="nl" href="agents.html">Agents</a>
+  <a class="nl" href="self-host.html">Self-host sync</a>
+  <a class="nl" href="security.html">Security</a>
+  <a class="nl" href="uninstall.html">Uninstall</a>
+  <span class="spacer"></span>
+  <a class="btn" href="https://github.com/nitishagar/agent-memory">GitHub</a>
+</div></nav>
+
+<div class="wrap">
+  <div class="hero">
+    <h1>Team memory for <span class="dim">coding agents.</span></h1>
+    <p class="sub">amem records shell history and agent transcripts on your
+    machine, serves them to any MCP agent, and syncs across your team over
+    TLS. No cloud, no telemetry — open source, Apache-2.0.</p>
+    <div class="cta">
+      <a class="btn primary" href="quickstart.html">Get started</a>
+      <a class="btn" href="self-host.html">Self-host sync</a>
+    </div>
+    <div class="install">
+      <div class="tabs">
+        <button class="active" data-cmd="curl -fsSL https://nitishagar.github.io/agent-memory/install.sh | bash">curl</button>
+        <button data-cmd="cargo install --git https://github.com/nitishagar/agent-memory amem-cli">cargo</button>
+      </div>
+      <pre><span class="prompt">$ </span><span id="cmd">curl -fsSL https://nitishagar.github.io/agent-memory/install.sh | bash</span></pre>
+    </div>
+    <div class="demo">
+      <div class="frame">
+        <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span style="margin-left:8px">amem demo — record, recall, share</span></div>
+        <img src="assets/demo.gif" alt="Terminal demo: amem records a command, recalls it with search, writes a shared note, and syncs with a teammate">
+      </div>
+    </div>
+  </div>
+
+  <section class="block">
+    <h2>How it works</h2>
+    <p class="lead">Four pieces, one binary. Everything runs locally until you point two machines at the same sync server.</p>
+    <div class="grid">
+      <div class="card"><h3><span class="k">01</span> capture</h3><p>Shell hooks (bash, zsh, fish, PowerShell) record every command with exit code, cwd, and duration. Secrets are redacted before they touch disk.</p></div>
+      <div class="card"><h3><span class="k">02</span> transcripts</h3><p>Agent sessions from Claude Code, Cursor, OpenCode, pi, ZCode, and Codex are ingested into the same store — your prompts stay searchable.</p></div>
+      <div class="card"><h3><span class="k">03</span> recall</h3><p>Six MCP tools (<code>mem_search</code>, <code>mem_read</code>, <code>mem_write</code>, …) give any agent your history, notes, and shared context over stdio.</p></div>
+      <div class="card"><h3><span class="k">04</span> sync</h3><p>Self-hosted TLS sync merges team histories into one immutable union. Conflicts branch instead of overwriting; corrupt data quarantines.</p></div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2>Free and open, all the way down</h2>
+    <p class="lead">Self-hosted team sync is free and open source. Two paid seams are planned for later — hosted sync and org controls — and neither gates the MVP.</p>
+  </section>
+</div>
+
+<footer><div class="wrap">
+  <span>amem — Apache-2.0</span><span class="spacer"></span>
+  <a href="https://github.com/nitishagar/agent-memory">GitHub</a>
+</div></footer>
+<script>
+document.querySelectorAll('.install .tabs button').forEach(function (b) {
+  b.addEventListener('click', function () {
+    document.querySelectorAll('.install .tabs button').forEach(function (x) { x.classList.remove('active'); });
+    b.classList.add('active');
+    document.getElementById('cmd').textContent = b.getAttribute('data-cmd');
+  });
+});
+</script>
+</body>
+</html>
