@@ -45,7 +45,7 @@ if grep -q "transcript warn" "$home/warnings.txt"; then pass "malformed warned";
 
 recall() { # <stream> <keyword> <want> — count search hits
   local n
-  n=$(AMEM_STORE_DIR="$store" "$AMEM_BIN" search "$2" --stream "$1" | wc -l)
+  n=$(AMEM_STORE_DIR="$store" "$AMEM_BIN" search "$2" --stream "$1" | wc -l | tr -d ' ')
   if [ "$n" = "$3" ]; then pass "$1 recall $2=$3"; else fail "$1 recall $2 got [$n] want $3"; fi
 }
 recall "transcript:claude" "Listing" 1

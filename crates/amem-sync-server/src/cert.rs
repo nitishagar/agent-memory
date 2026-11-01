@@ -4,6 +4,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use rustls_pki_types::pem::PemObject as _;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
 /// Filenames inside the server dir.
 pub const CERT_FILE: &str = "cert.pem";
 /// Filenames inside the server dir.
@@ -91,15 +94,14 @@ pub fn load_server_config(dir: &Path) -> amem_core::error::Result<rustls::Server
     let key_bytes = std::fs::read(dir.join(KEY_FILE)).map_err(|_| {
         io_err("server dir has no key.pem; run `amem sync-server --dir <dir> --init-cert` first")
     })?;
-    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_bytes.as_slice())
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(&cert_bytes)
         .filter_map(Result::ok)
         .collect();
     if certs.is_empty() {
         return Err(io_err("cert.pem holds no certificate"));
     }
-    let key = rustls_pemfile::private_key(&mut key_bytes.as_slice())
-        .map_err(|_| io_err("key.pem holds no private key"))?
-        .ok_or_else(|| io_err("key.pem holds no private key"))?;
+    let key = PrivateKeyDer::from_pem_slice(&key_bytes)
+        .map_err(|_| io_err("key.pem holds no private key"))?;
     rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .map_err(|e| io_err(&format!("tls: {e}")))?

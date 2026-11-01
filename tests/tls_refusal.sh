@@ -16,7 +16,9 @@ export AMEM_STORE_DIR="$store"
 fp=$(AMEM_STORE_DIR="$home/empty" "$AMEM_BIN" sync-server --dir "$srv" --init-cert)
 echo "$fp" | grep -q '"fingerprint":"[0-9a-f]\{64\}"' && pass "init-cert prints blake3 fingerprint" || fail "init-cert output: $fp"
 [ -f "$srv/cert.pem" ] && [ -f "$srv/key.pem" ] && pass "cert+key written" || fail "cert files"
-[ "$(stat -c %a "$srv/key.pem")" = "600" ] && pass "key.pem 0600" || fail "key perms"
+# GNU stat -c vs BSD stat -f: try either so the check runs on Linux and macOS.
+perms="$(stat -c %a "$srv/key.pem" 2>/dev/null || stat -f %Lp "$srv/key.pem" 2>/dev/null)"
+[ "$perms" = "600" ] && pass "key.pem 0600" || fail "key perms"
 
 port=$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1])")
 "$AMEM_BIN" sync-server --dir "$srv" --listen "127.0.0.1:$port" >/dev/null 2>&1 &

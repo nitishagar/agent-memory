@@ -64,7 +64,7 @@ echo "$out" | grep -q '"downloaded":2' && pass "A downloads 2" || fail "A sync2:
 
 dump_union "$sta" > "$home/ua.txt"
 dump_union "$stb" > "$home/ub.txt"
-if cmp -s "$home/ua.txt" "$home/ub.txt" && [ "$(wc -l < "$home/ua.txt")" = "5" ]; then
+if cmp -s "$home/ua.txt" "$home/ub.txt" && [ "$(wc -l < "$home/ua.txt" | tr -d ' ')" = "5" ]; then
   pass "byte-equal 5-record unions"
 else
   fail "union mismatch"; diff "$home/ua.txt" "$home/ub.txt" | head -5
@@ -97,7 +97,7 @@ out=$(AMEM_STORE_DIR="$sta" "$AMEM_BIN" sync --endpoint "$EP" 2>/dev/null)
 t1=$(date +%s)
 [ $((t1 - t0)) -le 120 ] && pass "10k fresh sync ≤120s ($((t1-t0))s)" || fail "10k too slow ($((t1-t0))s)"
 dump_union "$sta" > "$home/ua2.txt"
-[ "$(wc -l < "$home/ua2.txt")" = "10005" ] && pass "no dupes after kill -9 resume" || fail "dupe count: $(wc -l < "$home/ua2.txt")"
+[ "$(wc -l < "$home/ua2.txt" | tr -d ' ')" = "10005" ] && pass "no dupes after kill -9 resume" || fail "dupe count: $(wc -l < "$home/ua2.txt" | tr -d ' ')"
 t0=$(date +%s)
 out=$(AMEM_STORE_DIR="$stb" "$AMEM_BIN" sync --endpoint "$EP" 2>/dev/null)
 t1=$(date +%s)
