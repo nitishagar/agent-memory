@@ -206,6 +206,12 @@ impl AmemServer {
     }
 }
 
+// rmcp's `tool_handler` generates an await-free `async fn call_tool` impl;
+// clippy::unused_async_trait_impl (1.99+) flags it there, so allow it here —
+// the handler bodies below are where real awaits live. `unknown_lints` is
+// allowed alongside because pre-1.99 clippy does not know the lint name.
+#[allow(unknown_lints)]
+#[allow(clippy::unused_async_trait_impl)]
 #[tool_handler(
     name = "agent-memory",
     version = "0.1.0",

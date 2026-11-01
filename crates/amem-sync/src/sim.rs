@@ -110,66 +110,81 @@ impl SimulatedTransport {
 }
 
 impl Transport for SimulatedTransport {
-    async fn status(&self) -> Result<StatusDto, TransportError> {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(e) = Self::pre(&mut inner) {
-            return Err(e);
-        }
-        inner
-            .core
-            .status()
-            .map_err(|e| TransportError(e.to_string()))
+    // The bodies are synchronous (fault injection around a sync core); each
+    // wraps its original body in an immediately-invoked closure inside
+    // `std::future::ready` to satisfy the `+ Send` future the trait wants
+    // without an artificial await.
+    fn status(
+        &self,
+    ) -> impl std::future::Future<Output = Result<StatusDto, TransportError>> + Send {
+        std::future::ready((|| {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(e) = Self::pre(&mut inner) {
+                return Err(e);
+            }
+            inner
+                .core
+                .status()
+                .map_err(|e| TransportError(e.to_string()))
+        })())
     }
 
-    async fn next(
+    fn next(
         &self,
         device: &str,
         stream: &str,
         start: i64,
         count: i64,
-    ) -> Result<NextDto, TransportError> {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(e) = Self::pre(&mut inner) {
-            return Err(e);
-        }
-        let mut records = inner
-            .core
-            .next(device, stream, start, count)
-            .map_err(|e| TransportError(e.to_string()))?;
-        if inner.faults.reorder_page {
-            inner.faults.reorder_page = false;
-            records.reverse();
-        }
-        if inner.faults.junk_page {
-            inner.faults.junk_page = false;
-            records = vec!["{\"a\":1}".to_string(), "not json at all".to_string()];
-        }
-        let skew = inner.faults.skew_ms;
-        if skew != 0 {
-            records = records
-                .into_iter()
-                .map(|raw| skew_envelope(&raw, skew))
-                .collect();
-        }
-        Ok(NextDto { records })
+    ) -> impl std::future::Future<Output = Result<NextDto, TransportError>> + Send {
+        std::future::ready((|| {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(e) = Self::pre(&mut inner) {
+                return Err(e);
+            }
+            let mut records = inner
+                .core
+                .next(device, stream, start, count)
+                .map_err(|e| TransportError(e.to_string()))?;
+            if inner.faults.reorder_page {
+                inner.faults.reorder_page = false;
+                records.reverse();
+            }
+            if inner.faults.junk_page {
+                inner.faults.junk_page = false;
+                records = vec!["{\"a\":1}".to_string(), "not json at all".to_string()];
+            }
+            let skew = inner.faults.skew_ms;
+            if skew != 0 {
+                records = records
+                    .into_iter()
+                    .map(|raw| skew_envelope(&raw, skew))
+                    .collect();
+            }
+            Ok(NextDto { records })
+        })())
     }
 
-    async fn post(&self, body: &PostBody) -> Result<PostOutcome, TransportError> {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(e) = Self::pre(&mut inner) {
-            return Err(e);
-        }
-        // Core errors (malformed batch) surface as transport errors: the
-        // client treats them as failed calls, advancing nothing.
-        let out = inner
-            .core
-            .post(body)
-            .map_err(|e| TransportError(e.to_string()))?;
-        if inner.faults.dupe_post {
-            inner.faults.dupe_post = false;
-            let _ = inner.core.post(body);
-        }
-        Ok(out)
+    fn post(
+        &self,
+        body: &PostBody,
+    ) -> impl std::future::Future<Output = Result<PostOutcome, TransportError>> + Send {
+        std::future::ready((|| {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(e) = Self::pre(&mut inner) {
+                return Err(e);
+            }
+            // Core errors (malformed batch) surface as transport errors: the
+            // client treats them as failed calls, advancing nothing.
+            let out = inner
+                .core
+                .post(body)
+                .map_err(|e| TransportError(e.to_string()))?;
+            if inner.faults.dupe_post {
+                inner.faults.dupe_post = false;
+                let _ = inner.core.post(body);
+            }
+            Ok(out)
+        })())
     }
 }
 
