@@ -11,6 +11,15 @@ note() { echo "e2e4 [$1] $2"; }
 pass() { PASS=$((PASS+1)); note PASS "$1"; }
 fail() { FAIL=$((FAIL+1)); note FAIL "$1"; }
 
+# GNU timeout is absent on macOS; perl alarm+exec is the portable cap.
+run_timed() {
+  if [ "$(uname -s)" = "Darwin" ]; then
+    perl -e 'alarm shift; exec @ARGV' "$@"
+  else
+    timeout "$@"
+  fi
+}
+
 home="$(mktemp -d)"; srv="$home/srv"; sta="$home/sta"; stb="$home/stb"
 "$AMEM_BIN" sync-server --dir "$srv" --init-cert >/dev/null
 port=$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1])")
@@ -36,7 +45,7 @@ write_note() { # <store> <id> <text>
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"e","version":"0"}}}' \
     '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
     "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"mem_write\",\"arguments\":{\"id\":\"$2\",\"title\":\"t\",\"text\":\"$3\"}}}" \
-    | AMEM_STORE_DIR="$1" timeout 20 "$AMEM_BIN" mcp >/dev/null
+    | AMEM_STORE_DIR="$1" run_timed 20 "$AMEM_BIN" mcp >/dev/null
 }
 AMEM_STORE_DIR="$sta" "$AMEM_BIN" ingest --once --no-transcripts >/dev/null
 AMEM_STORE_DIR="$stb" "$AMEM_BIN" ingest --once --no-transcripts >/dev/null

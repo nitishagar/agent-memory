@@ -7,6 +7,15 @@ AMEM="${1:?usage: export_schema.sh <amem-binary>}"
 AMEM_BIN="$(cd "$(dirname "$AMEM")" && pwd)/$(basename "$AMEM")"
 FIXDIR="$(cd "$(dirname "$0")/../crates/amem-core/tests/fixtures/transcripts" && pwd)"
 
+# GNU timeout is absent on macOS; perl alarm+exec is the portable cap.
+run_timed() {
+  if [ "$(uname -s)" = "Darwin" ]; then
+    perl -e 'alarm shift; exec @ARGV' "$@"
+  else
+    timeout "$@"
+  fi
+}
+
 home="$(mktemp -d)"; store="$home/store"; fake="$home/fake"; vault="$home/vault"
 mkdir -p "$fake/claude/slug1"
 cp "$FIXDIR/claude_basic.jsonl" "$fake/claude/slug1/sess.jsonl"
@@ -27,7 +36,7 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ex","version":"0"}}}' \
   '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"mem_write","arguments":{"id":"plan","title":"ship","text":"cut the release"}}}' \
-  | timeout 20 "$AMEM_BIN" mcp >/dev/null
+  | run_timed 20 "$AMEM_BIN" mcp >/dev/null
 out=$("$AMEM_BIN" export --vault "$vault")
 echo "export_schema: $out"
 
