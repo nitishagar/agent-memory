@@ -889,45 +889,45 @@ impl Store {
                     rusqlite::Error::QueryReturnedNoRows => Ok(None),
                     other => Err(Error::Db(other)),
                 })?;
-            if let Some((owner_device, owner_stream, owner_idx)) = owner {
-                if owner_device != rec.device || owner_stream != rec.stream || owner_idx != idx {
-                    let winner_hash: String = tx.query_row(
-                        "SELECT hash FROM records WHERE device = ?1 AND stream = ?2 AND idx = ?3",
-                        params![owner_device, owner_stream, owner_idx],
-                        |r| r.get(0),
-                    )?;
-                    // Prefer the caller's wire bytes so this branch
-                    // collapses with the downloader's own `id` branch for
-                    // the same conflict (same loser hash, one row).
-                    let loser = loser_envelope.map_or_else(
-                        || {
-                            serde_json::json!({
-                                "id": ext_id, "device": rec.device, "stream": rec.stream,
-                                "idx": idx, "ts_ns": rec.ts_ns, "actor": rec.actor,
-                                "kind": rec.kind, "payload": rec.payload, "hash": rec.hash,
-                            })
-                            .to_string()
-                        },
-                        str::to_string,
-                    );
-                    let loser_hash = hash_payload(&loser);
-                    tx.execute(
-                        "INSERT OR IGNORE INTO branches
-                            (ext_id, stream, winner_device, winner_idx, winner_hash,
-                             loser_envelope, loser_hash, reason, ts_ns)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'id', ?8)",
-                        params![
-                            ext_id,
-                            owner_stream,
-                            owner_device,
-                            owner_idx,
-                            winner_hash,
-                            loser,
-                            loser_hash,
-                            crate::clock::now_nanos()
-                        ],
-                    )?;
-                }
+            if let Some((owner_device, owner_stream, owner_idx)) = owner
+                && (owner_device != rec.device || owner_stream != rec.stream || owner_idx != idx)
+            {
+                let winner_hash: String = tx.query_row(
+                    "SELECT hash FROM records WHERE device = ?1 AND stream = ?2 AND idx = ?3",
+                    params![owner_device, owner_stream, owner_idx],
+                    |r| r.get(0),
+                )?;
+                // Prefer the caller's wire bytes so this branch
+                // collapses with the downloader's own `id` branch for
+                // the same conflict (same loser hash, one row).
+                let loser = loser_envelope.map_or_else(
+                    || {
+                        serde_json::json!({
+                            "id": ext_id, "device": rec.device, "stream": rec.stream,
+                            "idx": idx, "ts_ns": rec.ts_ns, "actor": rec.actor,
+                            "kind": rec.kind, "payload": rec.payload, "hash": rec.hash,
+                        })
+                        .to_string()
+                    },
+                    str::to_string,
+                );
+                let loser_hash = hash_payload(&loser);
+                tx.execute(
+                    "INSERT OR IGNORE INTO branches
+                        (ext_id, stream, winner_device, winner_idx, winner_hash,
+                         loser_envelope, loser_hash, reason, ts_ns)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'id', ?8)",
+                    params![
+                        ext_id,
+                        owner_stream,
+                        owner_device,
+                        owner_idx,
+                        winner_hash,
+                        loser,
+                        loser_hash,
+                        crate::clock::now_nanos()
+                    ],
+                )?;
             }
         }
         tx.commit()?;
@@ -1559,12 +1559,12 @@ impl Store {
         .map_err(|e| {
             // Concurrent same-triple writers (sync + note update on cloned
             // ids) collide on the PK: typed Conflict, not a raw Db error.
-            if let rusqlite::Error::SqliteFailure(f, _) = &e {
-                if f.code == rusqlite::ErrorCode::ConstraintViolation {
-                    return Error::Conflict(format!(
-                        "notes/{next}: concurrent writer; re-read and retry"
-                    ));
-                }
+            if let rusqlite::Error::SqliteFailure(f, _) = &e
+                && f.code == rusqlite::ErrorCode::ConstraintViolation
+            {
+                return Error::Conflict(format!(
+                    "notes/{next}: concurrent writer; re-read and retry"
+                ));
             }
             Error::Db(e)
         })?;
@@ -1634,12 +1634,12 @@ fn id_row(r: &rusqlite::Row) -> rusqlite::Result<(String, i64)> {
 /// `SQLITE_BUSY` on an interactive write means another writer (e.g. a bulk
 /// ingest) holds the lock: the outcome is unknown, never silently retried.
 fn map_busy(e: rusqlite::Error, what: &str) -> Error {
-    if let rusqlite::Error::SqliteFailure(f, _) = &e {
-        if f.code == rusqlite::ErrorCode::DatabaseBusy {
-            return Error::OutcomeUnknown(format!(
-                "{what}: store locked by another writer; inspect state before retrying"
-            ));
-        }
+    if let rusqlite::Error::SqliteFailure(f, _) = &e
+        && f.code == rusqlite::ErrorCode::DatabaseBusy
+    {
+        return Error::OutcomeUnknown(format!(
+            "{what}: store locked by another writer; inspect state before retrying"
+        ));
     }
     Error::Db(e)
 }
@@ -1649,12 +1649,12 @@ fn map_busy(e: rusqlite::Error, what: &str) -> Error {
 /// passes through untouched.
 #[must_use]
 pub fn busy_to_unknown(e: Error, what: &str) -> Error {
-    if let Error::Db(rusqlite::Error::SqliteFailure(f, _)) = &e {
-        if f.code == rusqlite::ErrorCode::DatabaseBusy {
-            return Error::OutcomeUnknown(format!(
-                "{what}: store locked by another writer; inspect state before retrying"
-            ));
-        }
+    if let Error::Db(rusqlite::Error::SqliteFailure(f, _)) = &e
+        && f.code == rusqlite::ErrorCode::DatabaseBusy
+    {
+        return Error::OutcomeUnknown(format!(
+            "{what}: store locked by another writer; inspect state before retrying"
+        ));
     }
     e
 }
@@ -1802,7 +1802,7 @@ mod tests {
         let hits = store
             .search_stream("d1", "transcript:claude_", "needle", 10)
             .unwrap();
-        assert!(hits.is_empty());
+        assert!(hits.is_empty(), "{hits:?}");
         let hits = store
             .search_stream("d1", "transcript:claude", "needle", 10)
             .unwrap();
@@ -1813,7 +1813,7 @@ mod tests {
         assert_eq!(hits.len(), 2);
         // Text metacharacters are literal.
         let hits = store.search_stream("d1", "%", "need_e", 10).unwrap();
-        assert!(hits.is_empty());
+        assert!(hits.is_empty(), "{hits:?}");
     }
 
     #[test]
@@ -1910,7 +1910,8 @@ mod tests {
             store
                 .search_stream("d1", "shell", "quarantine-me", 10)
                 .unwrap()
-                .is_empty()
+                .is_empty(),
+            "quarantined record must not be searchable"
         );
         assert!(matches!(
             store.get_record("d1", "shell", idx),
@@ -1938,7 +1939,10 @@ mod tests {
                 .len(),
             1
         );
-        assert!(store.quarantine_list().unwrap().is_empty());
+        assert!(
+            store.quarantine_list().unwrap().is_empty(),
+            "quarantine must be empty"
+        );
     }
 
     #[test]
@@ -2326,7 +2330,10 @@ mod tests {
         a.payload = json!({"id": "deploy", "text": "alpha"});
         a.hash = hash_payload(&a.payload.to_string());
         assert!(store.apply_remote(&a, 0, "deploy", None).unwrap());
-        assert!(store.branch_list().unwrap().is_empty());
+        assert!(
+            store.branch_list().unwrap().is_empty(),
+            "no branches expected yet"
+        );
         // Second device, same id: record lands AND an id branch files.
         let mut b = sample("d2");
         b.stream = "notes".to_string();

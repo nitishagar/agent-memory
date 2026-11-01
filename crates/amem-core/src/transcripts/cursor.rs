@@ -103,20 +103,20 @@ pub fn parse_db(path: &Path, deadline: Instant) -> Result<(Vec<ParsedEvent>, Vec
         };
         if let Some(id) = key.strip_prefix("composerData:") {
             composers.insert(id.to_string(), composer_of(&parsed));
-        } else if let Some(rest) = key.strip_prefix("bubbleId:") {
-            if let Some((composer_id, _)) = rest.split_once(':') {
-                if composer_id.is_empty() {
-                    warnings.push(Warning {
-                        path: path.to_path_buf(),
-                        reason: format!("key {key}: empty composer id"),
-                    });
-                    continue;
-                }
-                bubbles
-                    .entry(composer_id.to_string())
-                    .or_default()
-                    .push(parsed);
+        } else if let Some(rest) = key.strip_prefix("bubbleId:")
+            && let Some((composer_id, _)) = rest.split_once(':')
+        {
+            if composer_id.is_empty() {
+                warnings.push(Warning {
+                    path: path.to_path_buf(),
+                    reason: format!("key {key}: empty composer id"),
+                });
+                continue;
             }
+            bubbles
+                .entry(composer_id.to_string())
+                .or_default()
+                .push(parsed);
         }
     }
 
@@ -320,7 +320,7 @@ mod tests {
             .execute_batch("CREATE TABLE t(x);")
             .unwrap();
         let (events, warnings) = parse_db(&path, Instant::now() + PASS_DEADLINE).unwrap();
-        assert!(events.is_empty());
+        assert!(events.is_empty(), "{events:?}");
         assert_eq!(warnings.len(), 1);
     }
 
@@ -350,7 +350,7 @@ mod tests {
         .unwrap();
         drop(conn);
         let (events, warnings) = parse_db(&path, Instant::now() + PASS_DEADLINE).unwrap();
-        assert!(events.is_empty());
+        assert!(events.is_empty(), "{events:?}");
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].reason.contains("oversize"));
     }

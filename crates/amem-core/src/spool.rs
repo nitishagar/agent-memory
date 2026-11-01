@@ -138,13 +138,19 @@ mod tests {
         assert_eq!(pending, vec![p.clone()]);
         shred(&p).unwrap();
         assert!(!p.exists());
-        assert!(pending_spools(&dir).unwrap().is_empty());
+        assert!(
+            pending_spools(&dir).unwrap().is_empty(),
+            "no pending spools"
+        );
     }
 
     #[test]
     fn missing_dir_yields_no_pending() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(pending_spools(&tmp.path().join("nope")).unwrap().is_empty());
+        assert!(
+            pending_spools(&tmp.path().join("nope")).unwrap().is_empty(),
+            "missing dir must yield no pending"
+        );
     }
 
     #[test]
@@ -169,7 +175,10 @@ mod tests {
         let victim = tmp.path().join("victim.txt");
         std::fs::write(&victim, "precious").unwrap();
         std::os::unix::fs::symlink(&victim, dir.join("spool-evil.jsonl")).unwrap();
-        assert!(pending_spools(&dir).unwrap().is_empty());
+        assert!(
+            pending_spools(&dir).unwrap().is_empty(),
+            "no pending spools"
+        );
         shred(&dir.join("spool-evil.jsonl")).unwrap();
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
     }

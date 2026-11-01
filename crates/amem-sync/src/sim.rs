@@ -183,10 +183,10 @@ fn skew_envelope(raw: &str, skew: i64) -> String {
         Ok(v) => v,
         Err(_) => return raw.to_string(),
     };
-    if let Some(wall) = v.get_mut("hlc").and_then(|h| h.get_mut("wall_ms")) {
-        if let Some(w) = wall.as_i64() {
-            *wall = serde_json::Value::from(w.saturating_add(skew));
-        }
+    if let Some(wall) = v.get_mut("hlc").and_then(|h| h.get_mut("wall_ms"))
+        && let Some(w) = wall.as_i64()
+    {
+        *wall = serde_json::Value::from(w.saturating_add(skew));
     }
     if let Some(ts) = v.get("ts_ns").and_then(serde_json::Value::as_i64) {
         v["ts_ns"] = serde_json::Value::from(ts.saturating_add(skew.saturating_mul(1_000_000)));

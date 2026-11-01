@@ -144,8 +144,8 @@ mod tests {
             .unwrap();
         }
         let (events, warnings) = cursor::parse_db(&path, Instant::now() + PASS_DEADLINE).unwrap();
-        assert!(events.is_empty());
-        assert!(!warnings.is_empty());
+        assert!(events.is_empty(), "{events:?}");
+        assert!(!warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]

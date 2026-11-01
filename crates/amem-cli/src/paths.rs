@@ -11,10 +11,10 @@ pub fn store_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(dir) = override_dir {
         return Ok(dir);
     }
-    if let Ok(env) = std::env::var("AMEM_STORE_DIR") {
-        if !env.is_empty() {
-            return Ok(PathBuf::from(env));
-        }
+    if let Ok(env) = std::env::var("AMEM_STORE_DIR")
+        && !env.is_empty()
+    {
+        return Ok(PathBuf::from(env));
     }
     amem_core::dirs::data_dir()
         .map(|d| d.join("agent-memory"))

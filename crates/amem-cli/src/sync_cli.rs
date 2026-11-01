@@ -10,12 +10,11 @@ use amem_core::store::{NewRecord, Store};
 
 /// Resolve a CLI id to a triple: `device/stream/idx` or an exact external id.
 pub fn resolve_triple(db: &Store, id: &str) -> Result<(String, String, i64)> {
-    if let Some((device, rest)) = id.split_once('/') {
-        if let Some((stream, idx_s)) = rest.split_once('/') {
-            if let Ok(idx) = idx_s.parse::<i64>() {
-                return Ok((device.to_string(), stream.to_string(), idx));
-            }
-        }
+    if let Some((device, rest)) = id.split_once('/')
+        && let Some((stream, idx_s)) = rest.split_once('/')
+        && let Ok(idx) = idx_s.parse::<i64>()
+    {
+        return Ok((device.to_string(), stream.to_string(), idx));
     }
     let hits = db.resolve_external_any(id, None)?;
     match hits.len() {
@@ -254,12 +253,11 @@ fn envelope_id(envelope: &str) -> String {
 
 /// Find a quarantine row by triple or by envelope id.
 fn find_quarantined(db: &Store, id: &str) -> Result<amem_core::store::Quarantined> {
-    if let Some((device, rest)) = id.split_once('/') {
-        if let Some((stream, idx_s)) = rest.split_once('/') {
-            if let Ok(idx) = idx_s.parse::<i64>() {
-                return db.quarantine_get(device, stream, idx);
-            }
-        }
+    if let Some((device, rest)) = id.split_once('/')
+        && let Some((stream, idx_s)) = rest.split_once('/')
+        && let Ok(idx) = idx_s.parse::<i64>()
+    {
+        return db.quarantine_get(device, stream, idx);
     }
     let mut hits = Vec::new();
     for q in db.quarantine_list()? {

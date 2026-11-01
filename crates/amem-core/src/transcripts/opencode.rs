@@ -376,7 +376,7 @@ pub(crate) mod tests {
             std::time::Instant::now() + crate::transcripts::PASS_DEADLINE,
         )
         .unwrap();
-        assert!(events.is_empty());
+        assert!(events.is_empty(), "{events:?}");
         assert_eq!(warnings.len(), 2);
     }
 
@@ -394,7 +394,7 @@ pub(crate) mod tests {
             Instant::now() + crate::transcripts::PASS_DEADLINE,
         )
         .unwrap();
-        assert!(events.is_empty());
+        assert!(events.is_empty(), "{events:?}");
         assert_eq!(warnings.len(), 1);
     }
 }

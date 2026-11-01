@@ -14,6 +14,8 @@ curl -fsSL https://nitishagar.github.io/agent-memory/install.sh | bash
 # or: cargo build --release && ./target/release/amem --help
 ```
 
+![amem demo: record, ingest, search](docs/assets/demo.gif)
+
 ## Record
 
 ```sh

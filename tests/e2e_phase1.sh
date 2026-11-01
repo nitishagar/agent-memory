@@ -60,15 +60,21 @@ run_bash_case() {
   printf '%s\n' "$CMDS20" > "$home/cmds.txt"
   python3 -c 'print("x"*1000005)' >> "$home/cmds.txt"
   echo "touch $home/done" >> "$home/cmds.txt"
+  # `exit` makes the interactive shell terminate itself: BSD script(1) (macOS)
+  # does not propagate producer EOF into the pty, so an interactive bash would
+  # otherwise sit waiting for input forever.
+  echo "exit" >> "$home/cmds.txt"
   # Hold stdin open until the sentinel lands: bare EOF makes `script` close
-  # the pty early and SIGHUPs the shell mid-run.
-  (cat "$home/cmds.txt"; while [ ! -f "$home/done" ]; do sleep 0.2; done; sleep 1) \
+  # the pty early and SIGHUPs the shell mid-run. Bounded so a shell that dies
+  # early fails the count check instead of hanging the job.
+  (cat "$home/cmds.txt"; n=0; while [ ! -f "$home/done" ] && [ "$n" -lt 150 ]; do sleep 0.2; n=$((n+1)); done; sleep 1) \
     | PATH="$(dirname "$AMEM_BIN"):$PATH" AMEM_STORE_DIR="$store" HOME="$home" \
     pty_run bash --noprofile --rcfile "$rc" -i >/dev/null 2>&1
   AMEM_STORE_DIR="$store" "$AMEM_BIN" ingest --once --no-transcripts >/dev/null
   local count
   count=$(AMEM_STORE_DIR="$store" "$AMEM_BIN" doctor | sed -n 's/.*records(shell): \([0-9]*\).*/\1/p')
-  # 20 + 1MB line + the sentinel `touch` itself (honestly captured).
+  # 20 + 1MB line + the sentinel `touch` itself. The trailing `exit` is
+  # unpaired (shell dies before precmd) and stays pending, never counted.
   if [ "$count" = "22" ]; then pass "bash pty recall 22/22"; else fail "bash pty recall got [$count] want 22"; fi
   # Edge top-up through the real binary (shell-independent ingest rules).
   AMEM_E1='echo one

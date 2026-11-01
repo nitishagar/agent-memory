@@ -273,7 +273,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stats, TranscriptStats::default());
-        assert!(warnings.is_empty());
+        assert!(warnings.is_empty(), "{warnings:?}");
         assert!(
             cursor::parse_db(
                 std::path::Path::new("/nonexistent"),

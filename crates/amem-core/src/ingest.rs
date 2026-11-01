@@ -364,7 +364,10 @@ mod tests {
         .unwrap();
         assert_eq!(stats.ingested, 1);
         assert_eq!(store.count_stream(&device, "shell").unwrap(), 1);
-        assert!(spool::pending_spools(&spool).unwrap().is_empty());
+        assert!(
+            spool::pending_spools(&spool).unwrap().is_empty(),
+            "spool must be drained"
+        );
         let rec = store.get_record(&device, "shell", 0).unwrap();
         assert!(rec.payload.contains("ls -la"));
     }
@@ -472,7 +475,10 @@ mod tests {
         .unwrap();
         assert_eq!(stats.incomplete, 1);
         assert_eq!(stats.pending_kept, 0);
-        assert!(spool::pending_spools(&spool).unwrap().is_empty());
+        assert!(
+            spool::pending_spools(&spool).unwrap().is_empty(),
+            "spool must be drained"
+        );
         let rec = store.get_record(&device, "shell", 0).unwrap();
         assert!(rec.payload.contains("\"completed\":false"));
     }

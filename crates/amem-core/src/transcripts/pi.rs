@@ -55,13 +55,13 @@ pub fn parse_file(
                     session = id.to_string();
                 }
                 project = str_field(&value, "cwd").to_string();
-                if let Some(v) = value.get("version").and_then(serde_json::Value::as_i64) {
-                    if v != 3 {
-                        warnings.push(Warning {
-                            path: path.to_path_buf(),
-                            reason: format!("line {line_no}: session version {v}, parsed as v3"),
-                        });
-                    }
+                if let Some(v) = value.get("version").and_then(serde_json::Value::as_i64)
+                    && v != 3
+                {
+                    warnings.push(Warning {
+                        path: path.to_path_buf(),
+                        reason: format!("line {line_no}: session version {v}, parsed as v3"),
+                    });
                 }
             }
             "message" => parse_message(&value, &session, &project, line_no, line, &mut events),
@@ -310,14 +310,14 @@ mod tests {
         let (events, warnings) = parse_str("2026-10-30T00-00-00-000Z_fallback99.jsonl", &body);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].reason.contains("no session header"));
-        assert!(!events.is_empty());
+        assert!(!events.is_empty(), "{events:?}");
         assert_eq!(events[0].event.session_id, "fallback99");
     }
 
     #[test]
     fn empty_file_warns_only() {
         let (events, warnings) = parse_str("x_empty.jsonl", "");
-        assert!(events.is_empty());
+        assert!(events.is_empty(), "{events:?}");
         assert_eq!(warnings.len(), 1);
     }
 }

@@ -313,12 +313,12 @@ impl Mem {
             Err(e) => return Err(e),
         };
         // An id owned by a recorder stream is not writable under any guard.
-        if existing.is_none() {
-            if let Ok((stream, _)) = db.resolve_external(&self.device, &id, None) {
-                return Err(Error::InvalidArguments(format!(
-                    "id {id} belongs to recorder stream {stream}; only notes are writable"
-                )));
-            }
+        if existing.is_none()
+            && let Ok((stream, _)) = db.resolve_external(&self.device, &id, None)
+        {
+            return Err(Error::InvalidArguments(format!(
+                "id {id} belongs to recorder stream {stream}; only notes are writable"
+            )));
         }
         let out = match (existing, checksum) {
             (None, Some(_)) => {
@@ -445,17 +445,16 @@ impl Mem {
 /// need the key `mem_read` accepts. Notes read the id from the payload
 /// (stale versions lost their mapping to the newer version).
 fn hit_id(db: &store::Store, rec: &Record) -> String {
-    if rec.stream == "notes" {
-        if let Some(id) = serde_json::from_str::<serde_json::Value>(&rec.payload)
+    if rec.stream == "notes"
+        && let Some(id) = serde_json::from_str::<serde_json::Value>(&rec.payload)
             .ok()
             .and_then(|v| {
                 v.get("id")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string)
             })
-        {
-            return id;
-        }
+    {
+        return id;
     }
     db.external_id(&rec.device, &rec.stream, rec.idx)
         .ok()
