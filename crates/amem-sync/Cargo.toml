@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-amem-core = { path = "../amem-core" }
+amem-core = { path = "../amem-core", version = "0.1.0" }
 bytes = "1"
 http = "1"
 http-body-util = "0.1"

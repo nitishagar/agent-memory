@@ -11,10 +11,10 @@ name = "amem"
 path = "src/main.rs"
 
 [dependencies]
-amem-core = { path = "../amem-core" }
-amem-mcp = { path = "../amem-mcp" }
-amem-sync = { path = "../amem-sync" }
-amem-sync-server = { path = "../amem-sync-server" }
+amem-core = { path = "../amem-core", version = "0.1.0" }
+amem-mcp = { path = "../amem-mcp", version = "0.1.0" }
+amem-sync = { path = "../amem-sync", version = "0.1.0" }
+amem-sync-server = { path = "../amem-sync-server", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }
 hostname = "0.4"
 serde = { version = "1.0.229", features = ["derive"] }

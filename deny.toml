@@ -1,7 +1,8 @@
 [licenses]
-unlicensed = "deny"
-allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "CC0-1.0", "Unicode-DFS-2016"]
-deny = ["AGPL-1.0", "AGPL-3.0", "GPL-1.0", "GPL-2.0", "GPL-3.0", "LGPL-2.0", "LGPL-2.1", "LGPL-3.0", "SSPL-1.0"]
+version = 2
+# licenses v2: anything not allow-listed (or excepted/clarified) is denied,
+# which subsumes the former explicit copyleft/SSPL deny list.
+allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "ISC", "Zlib", "CC0-1.0", "Unicode-3.0"]
 
 [licenses.private]
 ignore = true
