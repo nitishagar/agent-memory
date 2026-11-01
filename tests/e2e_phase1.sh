@@ -57,11 +57,19 @@ false
 true'
 
 run_bash_case() {
-  local home store rc
+  local home store rc want1 want2
   home="$(mktemp -d)"; store="$home/store"; rc="$home/rc"
   "$AMEM_BIN" --store-dir "$store" init bash > "$rc"
   printf '%s\n' "$CMDS20" > "$home/cmds.txt"
-  python3 -c 'print("x"*1000005)' >> "$home/cmds.txt"
+  # bash 3.2 (macOS /bin/bash) wedges its interactive readline on a 1MB line
+  # fed through a pty, so the long line only ships on bash >= 4. The 1MB
+  # truncation path itself is covered by amem-core unit tests everywhere.
+  if [ "$(bash -c 'echo ${BASH_VERSION%%.*}')" -ge 4 ]; then
+    python3 -c 'print("x"*1000005)' >> "$home/cmds.txt"
+    want1=22; want2=25
+  else
+    want1=21; want2=24
+  fi
   echo "touch $home/done" >> "$home/cmds.txt"
   # `exit` makes the interactive shell terminate itself: BSD script(1) (macOS)
   # does not propagate producer EOF into the pty, so an interactive bash would
@@ -76,12 +84,12 @@ run_bash_case() {
   AMEM_STORE_DIR="$store" "$AMEM_BIN" ingest --once --no-transcripts >/dev/null
   local count
   count=$(AMEM_STORE_DIR="$store" "$AMEM_BIN" doctor | sed -n 's/.*records(shell): \([0-9]*\).*/\1/p')
-  # 20 + 1MB line + the sentinel `touch` itself. The trailing `exit` is
+  # 20 + [1MB line] + the sentinel `touch` itself. The trailing `exit` is
   # unpaired (shell dies before precmd) and stays pending, never counted.
-  if [ "$count" = "22" ]; then
-    pass "bash pty recall 22/22"
+  if [ "$count" = "$want1" ]; then
+    pass "bash pty recall $want1/$want1"
   else
-    fail "bash pty recall got [$count] want 22"
+    fail "bash pty recall got [$count] want [$want1]"
     echo "e2e1: pty session transcript (first 40 lines):"
     sed -n '1,40p' "$home/pty.log" 2>/dev/null || echo "(no pty log)"
   fi
@@ -92,8 +100,8 @@ echo two' AMEM_STORE_DIR="$store" "$AMEM_BIN" history both --shell bash --exit 0
   AMEM_E1="$(printf 'a\x01b')" AMEM_STORE_DIR="$store" "$AMEM_BIN" history both --shell bash --exit 0 --cmd-from-env AMEM_E1 >/dev/null
   AMEM_STORE_DIR="$store" "$AMEM_BIN" ingest --once --no-transcripts > "$home/stats.json"
   count=$(AMEM_STORE_DIR="$store" "$AMEM_BIN" doctor | sed -n 's/.*records(shell): \([0-9]*\).*/\1/p')
-  # 22 pty + 2 multiline + control-char = 25; empties/NUL covered in unit tests.
-  if [ "$count" = "25" ]; then pass "bash edge top-up total 25"; else fail "bash edge total got [$count] want 25"; fi
+  # pty count + 2 multiline + control-char; empties/NUL covered in unit tests.
+  if [ "$count" = "$want2" ]; then pass "bash edge top-up total $want2"; else fail "bash edge total got [$count] want [$want2]"; fi
   if grep -q "supersecret1" "$home/stats.json"; then fail "bash secret in stats"; else pass "bash no leak"; fi
   if AMEM_STORE_DIR="$store" "$AMEM_BIN" doctor | grep -q "supersecret1"; then fail "bash secret in doctor"; else pass "bash store clean"; fi
   # Load-bearing: the secret must not be in queryable storage (DB payloads
