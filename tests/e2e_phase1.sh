@@ -22,13 +22,16 @@ fi
 # TERM=dumb keeps distro shell integrations (VTE) from loading: they fight
 # bash-preexec's PS0 dispatch in synthetic --rcfile sessions. Real terminals
 # are covered by the manual dogfood step in tests/E2E1.md.
+# Both forms are hard-capped at 120s: a wedged pty session must fail the
+# count check, not hang the job (macOS runners have no GNU timeout; perl's
+# alarm survives exec and SIGALRM kills script, closing the pty).
 pty_run() {
   if [ "$(uname -s)" = "Darwin" ]; then
-    TERM=dumb VTE_VERSION= script -q /dev/null "$@"
+    perl -e 'alarm shift; exec @ARGV' 120 script -q /dev/null "$@"
   else
     local cmd
     printf -v cmd '%q ' "$@"
-    TERM=dumb VTE_VERSION= script -qec "$cmd" /dev/null
+    TERM=dumb VTE_VERSION= timeout 120 script -qec "$cmd" /dev/null
   fi
 }
 
@@ -69,13 +72,19 @@ run_bash_case() {
   # early fails the count check instead of hanging the job.
   (cat "$home/cmds.txt"; n=0; while [ ! -f "$home/done" ] && [ "$n" -lt 150 ]; do sleep 0.2; n=$((n+1)); done; sleep 1) \
     | PATH="$(dirname "$AMEM_BIN"):$PATH" AMEM_STORE_DIR="$store" HOME="$home" \
-    pty_run bash --noprofile --rcfile "$rc" -i >/dev/null 2>&1
+    pty_run bash --noprofile --rcfile "$rc" -i > "$home/pty.log" 2>&1 || true
   AMEM_STORE_DIR="$store" "$AMEM_BIN" ingest --once --no-transcripts >/dev/null
   local count
   count=$(AMEM_STORE_DIR="$store" "$AMEM_BIN" doctor | sed -n 's/.*records(shell): \([0-9]*\).*/\1/p')
   # 20 + 1MB line + the sentinel `touch` itself. The trailing `exit` is
   # unpaired (shell dies before precmd) and stays pending, never counted.
-  if [ "$count" = "22" ]; then pass "bash pty recall 22/22"; else fail "bash pty recall got [$count] want 22"; fi
+  if [ "$count" = "22" ]; then
+    pass "bash pty recall 22/22"
+  else
+    fail "bash pty recall got [$count] want 22"
+    echo "e2e1: pty session transcript (first 40 lines):"
+    sed -n '1,40p' "$home/pty.log" 2>/dev/null || echo "(no pty log)"
+  fi
   # Edge top-up through the real binary (shell-independent ingest rules).
   AMEM_E1='echo one
 echo two' AMEM_STORE_DIR="$store" "$AMEM_BIN" history both --shell bash --exit 0 --cmd-from-env AMEM_E1 >/dev/null

@@ -127,14 +127,17 @@ fn errors_all_codes_text_and_json() {
         (unknown, "OUTCOME_UNKNOWN"),
     ] {
         assert_eq!(e.code(), code);
-        assert!(!retry_guidance(&e).is_empty());
+        assert!(!retry_guidance(&e).is_empty(), "retry guidance required");
         let text = render_error(&e, Format::Text);
         assert!(text.starts_with(code), "{text}");
         assert!(text.contains("retry:"), "{text}");
         let js = render_error(&e, Format::Json);
         let v: serde_json::Value = serde_json::from_str(&js).unwrap();
         assert_eq!(v["error"]["code"], code);
-        assert!(!v["error"]["retry"].as_str().unwrap().is_empty());
+        assert!(
+            !v["error"]["retry"].as_str().unwrap().is_empty(),
+            "json error must carry retry guidance"
+        );
     }
     // Bad format is itself a typed usage error.
     assert!(Format::parse(Some("yaml")).is_err());

@@ -309,7 +309,10 @@ fn search_finds_seeded_command() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    assert!(String::from_utf8(out.stdout).unwrap().is_empty());
+    assert!(
+        String::from_utf8(out.stdout).unwrap().is_empty(),
+        "no matches must print nothing"
+    );
 }
 
 #[test]

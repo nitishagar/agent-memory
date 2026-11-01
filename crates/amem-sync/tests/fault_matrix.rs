@@ -199,7 +199,10 @@ fn batch_atomic_rejects_whole_batch() {
         })
         .unwrap_err();
     assert!(out.to_string().contains("malformed"), "{out:?}");
-    assert!(core.status().unwrap().streams.is_empty());
+    assert!(
+        core.status().unwrap().streams.is_empty(),
+        "malformed batch must not land records"
+    );
     // The good record alone lands fine.
     let ok = core
         .post(&PostBody {
@@ -331,7 +334,10 @@ async fn skew_holds_cursor_and_heals_on_retry() {
         .unwrap();
     assert_eq!(s.downloaded, 2);
     let db = amem_core::store::Store::open(&dir_b).unwrap();
-    assert!(db.quarantine_list().unwrap().is_empty());
+    assert!(
+        db.quarantine_list().unwrap().is_empty(),
+        "union must not quarantine"
+    );
     assert_eq!(
         db.search_stream(
             &amem_core::store::device_id(&dir_b).unwrap(),
@@ -472,5 +478,5 @@ async fn post_rejects_negative_and_huge_idx() {
             "{err:?} idx={idx}"
         );
     }
-    assert!(core.status().unwrap().streams.is_empty());
+    assert!(core.status().unwrap().streams.is_empty(), "nothing landed");
 }
